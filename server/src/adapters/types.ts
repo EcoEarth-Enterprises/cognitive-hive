@@ -29,4 +29,9 @@ export type {
   ConfigFieldSchema,
   AdapterConfigSchema,
   ServerAdapterModule,
+  DiscoveredAgent,
+  DiscoverAgentsInput,
+  DiscoverAgentsResult,
+  DiscoveryErrorKind,
 } from "@paperclipai/adapter-utils";
+export { DiscoveryError } from "@paperclipai/adapter-utils";

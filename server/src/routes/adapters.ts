@@ -66,6 +66,11 @@ interface AdapterCapabilities {
   supportsSkills: boolean;
   supportsLocalAgentJwt: boolean;
   requiresMaterializedRuntimeSkills: boolean;
+  /**
+   * True when the adapter implements discoverAgents() and can enumerate
+   * existing external agents for the "hire existing" UI flow.
+   */
+  supportsDiscovery: boolean;
 }
 
 interface AdapterInfo {
@@ -119,6 +124,7 @@ function buildAdapterCapabilities(adapter: ServerAdapterModule): AdapterCapabili
     supportsSkills: Boolean(adapter.listSkills || adapter.syncSkills),
     supportsLocalAgentJwt: adapter.supportsLocalAgentJwt ?? false,
     requiresMaterializedRuntimeSkills: adapter.requiresMaterializedRuntimeSkills ?? false,
+    supportsDiscovery: Boolean(adapter.discoverAgents),
   };
 }
 
