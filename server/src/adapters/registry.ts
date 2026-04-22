@@ -50,6 +50,7 @@ import {
 import {
   execute as openclawGatewayExecute,
   testEnvironment as openclawGatewayTestEnvironment,
+  discoverAgents as openclawGatewayDiscoverAgents,
 } from "@paperclipai/adapter-openclaw-gateway/server";
 import {
   agentConfigurationDoc as openclawGatewayAgentConfigurationDoc,
@@ -190,6 +191,7 @@ const openclawGatewayAdapter: ServerAdapterModule = {
   type: "openclaw_gateway",
   execute: openclawGatewayExecute,
   testEnvironment: openclawGatewayTestEnvironment,
+  discoverAgents: openclawGatewayDiscoverAgents,
   models: openclawGatewayModels,
   supportsLocalAgentJwt: false,
   supportsInstructionsBundle: false,
