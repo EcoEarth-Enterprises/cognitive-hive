@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useNavigate } from "@/lib/router";
+import { useNavigate, useSearchParams } from "@/lib/router";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { agentsApi } from "../api/agents";
@@ -39,6 +39,9 @@ export function ImportAgent() {
   const { setBreadcrumbs } = useBreadcrumbs();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const repairAgentId = searchParams.get("repair");
+  const isRepair = Boolean(repairAgentId);
 
   const [step, setStep] = useState<Step>("adapter");
   const [adapterType, setAdapterType] = useState<string | null>(null);
@@ -59,9 +62,29 @@ export function ImportAgent() {
   useEffect(() => {
     setBreadcrumbs([
       { label: "Agents", href: "/agents" },
-      { label: "Import Agent" },
+      { label: isRepair ? "Repair Agent Connection" : "Import Agent" },
     ]);
-  }, [setBreadcrumbs]);
+  }, [setBreadcrumbs, isRepair]);
+
+  const { data: existingAgent } = useQuery({
+    queryKey: ["agent", repairAgentId, "for-repair"],
+    queryFn: () => agentsApi.get(repairAgentId!),
+    enabled: Boolean(repairAgentId),
+  });
+
+  useEffect(() => {
+    if (!existingAgent) return;
+    // Pre-fill from the existing agent and skip the adapter-pick step.
+    setAdapterType(existingAgent.adapterType);
+    const cfg = (existingAgent.adapterConfig ?? {}) as Record<string, unknown>;
+    if (typeof cfg.url === "string") setUrl(cfg.url);
+    if (typeof cfg.agentId === "string") setSelectedAgentId(cfg.agentId);
+    setName(existingAgent.name);
+    setTitle(existingAgent.title ?? "");
+    setRole(existingAgent.role);
+    setReportsTo(existingAgent.reportsTo ?? null);
+    setStep("discover");
+  }, [existingAgent]);
 
   const { data: adapters, isLoading: adaptersLoading } = useQuery({
     queryKey: ["adapters", "list"],
@@ -116,6 +139,18 @@ export function ImportAgent() {
     },
   });
 
+  const repairMutation = useMutation({
+    mutationFn: (data: Record<string, unknown>) => agentsApi.update(repairAgentId!, data),
+    onSuccess: (updated) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(selectedCompanyId!) });
+      queryClient.invalidateQueries({ queryKey: ["agent", repairAgentId] });
+      navigate(agentUrl(updated));
+    },
+    onError: (error) => {
+      setSubmitError(error instanceof Error ? error.message : "Update failed");
+    },
+  });
+
   function pickAdapter(type: string) {
     setAdapterType(type);
     setUrl("");
@@ -134,6 +169,17 @@ export function ImportAgent() {
   function handleSubmit() {
     if (!selectedCompanyId || !adapterType || !selectedAgentId || !name.trim()) return;
     setSubmitError(null);
+    if (isRepair && repairAgentId) {
+      // Repair flow: PATCH the existing agent's adapterConfig only.
+      // Name/role/budget stay as they were.
+      repairMutation.mutate({
+        adapterConfig: {
+          url: url.trim(),
+          agentId: selectedAgentId,
+        },
+      });
+      return;
+    }
     importMutation.mutate({
       name: name.trim(),
       role,
@@ -157,14 +203,20 @@ export function ImportAgent() {
     <div className="mx-auto max-w-3xl space-y-6 py-8">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold">Import Existing Agent</h1>
+          <h1 className="text-2xl font-semibold">
+            {isRepair ? "Repair Agent Connection" : "Import Existing Agent"}
+          </h1>
           <p className="text-sm text-muted-foreground">
-            Register an agent that already runs on an external runtime.
+            {isRepair
+              ? "Re-enumerate the external runtime and re-point this agent's connection."
+              : "Register an agent that already runs on an external runtime."}
           </p>
         </div>
-        <Button variant="ghost" onClick={() => navigate("/agents/new")}>
-          Creating a new agent? →
-        </Button>
+        {!isRepair && (
+          <Button variant="ghost" onClick={() => navigate("/agents/new")}>
+            Creating a new agent? →
+          </Button>
+        )}
       </div>
 
       <WizardHeader step={step} />
@@ -208,8 +260,9 @@ export function ImportAgent() {
           budgetMonthly={budgetMonthly}
           setBudgetMonthly={setBudgetMonthly}
           availableAgents={(agents ?? []) as Agent[]}
-          submitting={importMutation.isPending}
+          submitting={importMutation.isPending || repairMutation.isPending}
           error={submitError}
+          isRepair={isRepair}
           onBack={() => setStep("discover")}
           onSubmit={handleSubmit}
         />
@@ -455,6 +508,7 @@ function ConfirmStep({
   availableAgents,
   submitting,
   error,
+  isRepair,
   onBack,
   onSubmit,
 }: {
@@ -474,6 +528,7 @@ function ConfirmStep({
   availableAgents: Agent[];
   submitting: boolean;
   error: string | null;
+  isRepair: boolean;
   onBack: () => void;
   onSubmit: () => void;
 }) {
@@ -542,7 +597,13 @@ function ConfirmStep({
         <div className="flex justify-between">
           <Button variant="ghost" onClick={onBack}>← Back</Button>
           <Button onClick={onSubmit} disabled={submitting || !name.trim()}>
-            {submitting ? "Importing…" : "Import agent"}
+            {submitting
+              ? isRepair
+                ? "Updating…"
+                : "Importing…"
+              : isRepair
+              ? "Update connection"
+              : "Import agent"}
           </Button>
         </div>
       </CardContent>
