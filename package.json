@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "preflight:workspace-links": "node cli/node_modules/tsx/dist/cli.mjs scripts/ensure-workspace-package-links.ts",
-    "dev": "pnpm --filter @paperclipai/server exec tsx ../scripts/dev-runner.ts watch",
+    "dev": "cross-env PAPERCLIP_INSTANCE_ID=cognitive-hive pnpm --filter @paperclipai/server exec tsx ../scripts/dev-runner.ts watch",
     "dev:watch": "pnpm --filter @paperclipai/server exec tsx ../scripts/dev-runner.ts watch",
     "dev:once": "pnpm --filter @paperclipai/server exec tsx ../scripts/dev-runner.ts dev",
     "dev:list": "pnpm --filter @paperclipai/server exec tsx ../scripts/dev-service.ts list",
@@ -19,7 +19,7 @@
     "test:watch": "pnpm run preflight:workspace-links && vitest",
     "test:run": "pnpm run preflight:workspace-links && vitest run",
     "db:generate": "pnpm --filter @paperclipai/db generate",
-    "db:migrate": "pnpm --filter @paperclipai/db migrate",
+    "db:migrate": "cross-env PAPERCLIP_INSTANCE_ID=cognitive-hive pnpm --filter @paperclipai/db migrate",
     "issue-references:backfill": "pnpm run preflight:workspace-links && tsx scripts/backfill-issue-reference-mentions.ts",
     "secrets:migrate-inline-env": "tsx scripts/migrate-inline-env-secrets.ts",
     "db:backup": "./scripts/backup-db.sh",
