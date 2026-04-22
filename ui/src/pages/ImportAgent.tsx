@@ -25,7 +25,7 @@ import { ReportsToPicker } from "../components/ReportsToPicker";
 import type { Agent } from "@paperclipai/shared";
 import { agentUrl } from "../lib/utils";
 import { roleLabels } from "../components/agent-config-primitives";
-import { ClipboardCopy, AlertTriangle, CheckCircle2 } from "lucide-react";
+import { ClipboardCopy, AlertTriangle, CheckCircle2, Check } from "lucide-react";
 
 type Step = "adapter" | "discover" | "confirm";
 
@@ -58,6 +58,7 @@ export function ImportAgent() {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [issuedKey, setIssuedKey] = useState<{ token: string; agentId: string; agentName: string } | null>(null);
   const [keySaved, setKeySaved] = useState(false);
+  const [keyCopied, setKeyCopied] = useState(false);
 
   useEffect(() => {
     setBreadcrumbs([
@@ -287,11 +288,27 @@ export function ImportAgent() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => {
-                if (issuedKey) void navigator.clipboard.writeText(issuedKey.token);
+              onClick={async () => {
+                if (!issuedKey) return;
+                try {
+                  await navigator.clipboard.writeText(issuedKey.token);
+                  setKeyCopied(true);
+                  setTimeout(() => setKeyCopied(false), 2000);
+                } catch {
+                  // clipboard write can fail in insecure contexts; leave UI unchanged
+                }
               }}
+              className={keyCopied ? "bg-green-500/10 border-green-500/50 text-green-700 dark:text-green-400" : undefined}
             >
-              <ClipboardCopy className="h-3 w-3 mr-2" /> Copy to clipboard
+              {keyCopied ? (
+                <>
+                  <Check className="h-3 w-3 mr-2" /> Copied!
+                </>
+              ) : (
+                <>
+                  <ClipboardCopy className="h-3 w-3 mr-2" /> Copy to clipboard
+                </>
+              )}
             </Button>
             <p className="text-muted-foreground text-xs">
               Paste this into your external runtime's paperclip config. For OpenClaw, save
