@@ -280,16 +280,16 @@ Find Plugins and more at [awesome-paperclip](https://github.com/gsxdsm/awesome-p
 
 ## Telemetry
 
-Paperclip collects anonymous usage telemetry to help us understand how the product is used and improve it. No personal information, issue content, prompts, file paths, or secrets are ever collected. Private repository references are hashed with a per-install salt before being sent.
+Telemetry is **disabled by default** in Cognitive Hive. No usage data is collected unless you explicitly opt in. The upstream Paperclip telemetry pipeline still exists in the code, but it will not transmit anything until you enable it.
 
-Telemetry is **enabled by default** and can be disabled with any of the following:
+To opt in, set `telemetry.enabled: true` in your config file. Even when opted in, the existing environment kill-switches still apply:
 
-| Method               | How                                                     |
-| -------------------- | ------------------------------------------------------- |
-| Environment variable | `PAPERCLIP_TELEMETRY_DISABLED=1`                        |
-| Standard convention  | `DO_NOT_TRACK=1`                                        |
-| CI environments      | Automatically disabled when `CI=true`                   |
-| Config file          | Set `telemetry.enabled: false` in your Paperclip config |
+| Method               | How                                                            |
+| -------------------- | -------------------------------------------------------------- |
+| Config file (opt-in) | Set `telemetry.enabled: true` in your Cognitive Hive config    |
+| Environment variable | `PAPERCLIP_TELEMETRY_DISABLED=1` forces off                    |
+| Standard convention  | `DO_NOT_TRACK=1` forces off                                    |
+| CI environments      | Automatically disabled when `CI=true`                          |
 
 ## Contributing
 

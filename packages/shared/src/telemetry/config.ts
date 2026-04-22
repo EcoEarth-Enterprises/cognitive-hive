@@ -16,7 +16,7 @@ export function resolveTelemetryConfig(fileConfig?: { enabled?: boolean }): Tele
   if (isCI()) {
     return { enabled: false };
   }
-  if (fileConfig?.enabled === false) {
+  if (fileConfig?.enabled !== true) {
     return { enabled: false };
   }
 
