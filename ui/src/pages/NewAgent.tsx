@@ -204,6 +204,18 @@ export function NewAgent() {
         </p>
       </div>
 
+      <div className="rounded-md border border-border/70 bg-muted/40 px-3 py-2 text-sm flex items-center justify-between">
+        <span className="text-muted-foreground">Have an agent already running?</span>
+        <Button
+          variant="link"
+          size="sm"
+          className="px-1 h-auto"
+          onClick={() => navigate("/agents/import")}
+        >
+          Import it instead →
+        </Button>
+      </div>
+
       <div className="border border-border">
         {/* Name */}
         <div className="px-4 pt-4 pb-2">

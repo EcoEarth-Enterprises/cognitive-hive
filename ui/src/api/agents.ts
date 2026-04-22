@@ -57,6 +57,17 @@ export interface AgentHireResponse {
   approval: Approval | null;
 }
 
+export interface AgentImportResponse {
+  agent: Agent;
+  apiKey: {
+    id: string;
+    name: string;
+    token: string;
+    createdAt: string;
+  };
+  approval: Approval | null;
+}
+
 export interface AgentPermissionUpdate {
   canCreateAgents: boolean;
   canAssignTasks: boolean;
@@ -115,6 +126,8 @@ export const agentsApi = {
     api.post<Agent>(`/companies/${companyId}/agents`, data),
   hire: (companyId: string, data: Record<string, unknown>) =>
     api.post<AgentHireResponse>(`/companies/${companyId}/agent-hires`, data),
+  importExisting: (companyId: string, data: Record<string, unknown>) =>
+    api.post<AgentImportResponse>(`/companies/${companyId}/agent-imports`, data),
   update: (id: string, data: Record<string, unknown>, companyId?: string) =>
     api.patch<Agent>(agentPath(id, companyId), data),
   updatePermissions: (id: string, data: AgentPermissionUpdate, companyId?: string) =>

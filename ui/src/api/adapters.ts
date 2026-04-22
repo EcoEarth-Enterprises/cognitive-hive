@@ -9,7 +9,28 @@ export interface AdapterCapabilities {
   supportsSkills: boolean;
   supportsLocalAgentJwt: boolean;
   requiresMaterializedRuntimeSkills: boolean;
+  supportsDiscovery: boolean;
 }
+
+export interface DiscoveredAgent {
+  id: string;
+  name: string;
+  description?: string;
+  status?: "idle" | "running" | "error" | "unknown";
+  metadata?: Record<string, unknown>;
+}
+
+export interface DiscoverAgentsResult {
+  agents: DiscoveredAgent[];
+  warnings?: string[];
+}
+
+export type DiscoveryErrorKind =
+  | "unreachable"
+  | "unauthorized"
+  | "not_supported"
+  | "invalid_config"
+  | "internal";
 
 export interface AdapterInfo {
   type: string;
@@ -64,4 +85,11 @@ export const adaptersApi = {
   /** Reinstall an npm-sourced adapter (pulls latest from registry, then reloads). */
   reinstall: (type: string) =>
     api.post<{ type: string; version?: string; reinstalled: boolean }>(`/adapters/${type}/reinstall`, {}),
+
+  /**
+   * Enumerate existing agents on an external runtime via the adapter's
+   * discoverAgents() method. Used by the /agents/import flow.
+   */
+  discover: (type: string, connectionConfig: Record<string, unknown>) =>
+    api.post<DiscoverAgentsResult>(`/adapters/${type}/discover`, { connectionConfig }),
 };
