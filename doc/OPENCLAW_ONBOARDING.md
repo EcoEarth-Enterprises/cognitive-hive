@@ -1,3 +1,14 @@
+> **Note (Cognitive Hive fork):** If you have an OpenClaw gateway already
+> running and just want to import a specific agent into your company, use the
+> **Hire Existing Agent** UI at `/agents/import`. It enumerates agents on the
+> gateway, auto-issues the paperclip API key, and skips this invite-prompt
+> round-trip entirely. See [designs/hire-existing-agent.md](designs/hire-existing-agent.md)
+> for the full flow, or `scripts/smoke/openclaw-import.sh` for the
+> programmatic equivalent.
+>
+> The checklist below remains the supported path for fresh OpenClaw
+> installations and for the "agent initiates the join" ergonomics.
+
 Use this exact checklist.
 
 1. Start Paperclip in auth mode.
