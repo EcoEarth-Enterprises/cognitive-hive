@@ -4,7 +4,7 @@ import { useNavigate, useSearchParams } from "@/lib/router";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { agentsApi } from "../api/agents";
-import { adaptersApi, type AdapterInfo, type DiscoveredAgent } from "../api/adapters";
+import { adaptersApi, type AdapterInfo, type DiscoveredAgent, type ApiKeyStorageStatus } from "../api/adapters";
 import { queryKeys } from "../lib/queryKeys";
 import { AGENT_ROLES } from "@paperclipai/shared";
 import { Button } from "@/components/ui/button";
@@ -56,9 +56,19 @@ export function ImportAgent() {
   const [reportsTo, setReportsTo] = useState<string | null>(null);
   const [budgetMonthly, setBudgetMonthly] = useState(0);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  const [issuedKey, setIssuedKey] = useState<{ token: string; agentId: string; agentName: string } | null>(null);
-  const [keySaved, setKeySaved] = useState(false);
-  const [keyCopied, setKeyCopied] = useState(false);
+  const [keyBehavior, setKeyBehavior] = useState<"auto" | "overwrite">("auto");
+  // Fallback modal: only shown when the server had to return a plaintext token
+  // because it couldn't write the file (or the adapter uses env storage).
+  const [fallback, setFallback] = useState<{
+    token: string;
+    path?: string;
+    envVariable?: string;
+    agentId: string;
+    agentName: string;
+    writeError?: string;
+  } | null>(null);
+  const [fallbackCopied, setFallbackCopied] = useState(false);
+  const [fallbackSaved, setFallbackSaved] = useState(false);
 
   useEffect(() => {
     setBreadcrumbs([
@@ -103,6 +113,18 @@ export function ImportAgent() {
     [adapters],
   );
 
+  // Fetch API key storage status once we've picked an adapter + URL so the
+  // confirm step can tell the user what will happen (auto-write, reuse, etc).
+  const { data: storageStatus } = useQuery<ApiKeyStorageStatus>({
+    queryKey: ["adapters", adapterType, "api-key-storage", url, selectedAgentId],
+    queryFn: () =>
+      adaptersApi.apiKeyStorage(adapterType!, {
+        url: url.trim(),
+        agentId: selectedAgentId,
+      }),
+    enabled: Boolean(step === "confirm" && adapterType && url && selectedAgentId && !isRepair),
+  });
+
   const discoverMutation = useMutation({
     mutationFn: async () => {
       if (!adapterType) throw new Error("Adapter not selected");
@@ -129,10 +151,23 @@ export function ImportAgent() {
     onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(selectedCompanyId!) });
       queryClient.invalidateQueries({ queryKey: queryKeys.approvals.list(selectedCompanyId!) });
-      setIssuedKey({
-        token: result.apiKey.token,
+
+      // Happy path: server wrote the file (or reused existing, or adapter is
+      // keyless). No manual token handling needed — navigate to the agent page.
+      if (!result.fallbackToken) {
+        navigate(agentUrl(result.agent));
+        return;
+      }
+
+      // Fallback: server needed the user to handle the token manually (write
+      // failed, or adapter uses env storage with no file to write). Surface
+      // the plaintext token in a copy-manually modal.
+      setFallback({
+        token: result.fallbackToken,
+        path: result.keyPath,
         agentId: result.agent.id,
         agentName: result.agent.name,
+        writeError: result.writeError,
       });
     },
     onError: (error) => {
@@ -192,12 +227,13 @@ export function ImportAgent() {
         agentId: selectedAgentId,
       },
       budgetMonthlyCents: Math.max(0, Math.round(budgetMonthly * 100)),
+      keyBehavior,
     });
   }
 
-  function handleKeyModalContinue() {
-    if (!issuedKey) return;
-    navigate(agentUrl({ id: issuedKey.agentId, name: issuedKey.agentName } as Parameters<typeof agentUrl>[0]));
+  function handleFallbackContinue() {
+    if (!fallback) return;
+    navigate(agentUrl({ id: fallback.agentId, name: fallback.agentName } as Parameters<typeof agentUrl>[0]));
   }
 
   return (
@@ -264,43 +300,53 @@ export function ImportAgent() {
           submitting={importMutation.isPending || repairMutation.isPending}
           error={submitError}
           isRepair={isRepair}
+          keyBehavior={keyBehavior}
+          setKeyBehavior={setKeyBehavior}
+          storageStatus={storageStatus ?? null}
           onBack={() => setStep("discover")}
           onSubmit={handleSubmit}
         />
       )}
 
-      <Dialog open={Boolean(issuedKey)}>
+      <Dialog open={Boolean(fallback)}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
-              <CheckCircle2 className="h-5 w-5 text-green-500" />
-              Agent imported
+              <AlertTriangle className="h-5 w-5 text-amber-500" />
+              Save your API key manually
             </DialogTitle>
           </DialogHeader>
           <div className="space-y-4 text-sm">
-            <p>
-              Your paperclip API key has been issued. This is shown{" "}
-              <strong>once</strong> — save it now.
-            </p>
+            {fallback?.writeError ? (
+              <p>
+                We couldn't write the paperclip API key automatically:{" "}
+                <code className="text-xs">{fallback.writeError}</code>
+              </p>
+            ) : (
+              <p>
+                Your agent is imported, but this adapter needs you to save the
+                paperclip API key manually.
+              </p>
+            )}
             <div className="rounded-md border bg-muted p-3 font-mono text-xs break-all">
-              {issuedKey?.token}
+              {fallback?.token}
             </div>
             <Button
               variant="outline"
               size="sm"
               onClick={async () => {
-                if (!issuedKey) return;
+                if (!fallback) return;
                 try {
-                  await navigator.clipboard.writeText(issuedKey.token);
-                  setKeyCopied(true);
-                  setTimeout(() => setKeyCopied(false), 2000);
+                  await navigator.clipboard.writeText(fallback.token);
+                  setFallbackCopied(true);
+                  setTimeout(() => setFallbackCopied(false), 2000);
                 } catch {
-                  // clipboard write can fail in insecure contexts; leave UI unchanged
+                  // clipboard write can fail in insecure contexts
                 }
               }}
-              className={keyCopied ? "bg-green-500/10 border-green-500/50 text-green-700 dark:text-green-400" : undefined}
+              className={fallbackCopied ? "bg-green-500/10 border-green-500/50 text-green-700 dark:text-green-400" : undefined}
             >
-              {keyCopied ? (
+              {fallbackCopied ? (
                 <>
                   <Check className="h-3 w-3 mr-2" /> Copied!
                 </>
@@ -310,19 +356,21 @@ export function ImportAgent() {
                 </>
               )}
             </Button>
-            <p className="text-muted-foreground text-xs">
-              Paste this into your external runtime's paperclip config. For OpenClaw, save
-              it to <code>~/.openclaw/workspace/paperclip-claimed-api-key.json</code>.
-            </p>
+            {fallback?.path && (
+              <p className="text-muted-foreground text-xs">
+                Save this to <code>{fallback.path}</code> as JSON:{" "}
+                <code>{'{"paperclipApiKey":"<token>"}'}</code>
+              </p>
+            )}
             <label className="flex items-center gap-2 text-sm">
               <Checkbox
-                checked={keySaved}
-                onCheckedChange={(v) => setKeySaved(Boolean(v))}
+                checked={fallbackSaved}
+                onCheckedChange={(v) => setFallbackSaved(Boolean(v))}
               />
               I've saved this key
             </label>
             <div className="flex justify-end">
-              <Button onClick={handleKeyModalContinue} disabled={!keySaved}>
+              <Button onClick={handleFallbackContinue} disabled={!fallbackSaved}>
                 Continue →
               </Button>
             </div>
@@ -526,6 +574,9 @@ function ConfirmStep({
   submitting,
   error,
   isRepair,
+  keyBehavior,
+  setKeyBehavior,
+  storageStatus,
   onBack,
   onSubmit,
 }: {
@@ -546,6 +597,9 @@ function ConfirmStep({
   submitting: boolean;
   error: string | null;
   isRepair: boolean;
+  keyBehavior: "auto" | "overwrite";
+  setKeyBehavior: (v: "auto" | "overwrite") => void;
+  storageStatus: ApiKeyStorageStatus | null;
   onBack: () => void;
   onSubmit: () => void;
 }) {
@@ -607,6 +661,14 @@ function ConfirmStep({
           />
         </div>
 
+        {!isRepair && storageStatus && (
+          <ApiKeyStoragePanel
+            status={storageStatus}
+            behavior={keyBehavior}
+            onChangeBehavior={setKeyBehavior}
+          />
+        )}
+
         {error && (
           <div className="text-sm text-destructive">{error}</div>
         )}
@@ -626,6 +688,123 @@ function ConfirmStep({
       </CardContent>
     </Card>
   );
+}
+
+function ApiKeyStoragePanel({
+  status,
+  behavior,
+  onChangeBehavior,
+}: {
+  status: ApiKeyStorageStatus;
+  behavior: "auto" | "overwrite";
+  onChangeBehavior: (v: "auto" | "overwrite") => void;
+}) {
+  const d = status.descriptor;
+
+  if (d.kind === "none") {
+    return (
+      <div className="rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground">
+        This adapter doesn't use filesystem keys. Nothing to save after import.
+      </div>
+    );
+  }
+
+  if (d.kind === "env") {
+    return (
+      <div className="rounded-md border bg-muted/30 p-3 text-xs">
+        <div className="font-medium mb-1">API key delivery</div>
+        <div className="text-muted-foreground">
+          This adapter reads the paperclip API key from the{" "}
+          <code>{d.variable}</code> environment variable. A new key will be
+          issued on import and shown to you once so you can set it.
+        </div>
+      </div>
+    );
+  }
+
+  // kind === "file"
+  const displayPath = status.absolutePath ?? d.path;
+  if (!status.exists) {
+    return (
+      <div className="rounded-md border border-green-500/40 bg-green-500/5 p-3 text-xs space-y-1">
+        <div className="font-medium text-green-700 dark:text-green-400">
+          API key will be issued and saved automatically
+        </div>
+        <div className="text-muted-foreground">
+          A fresh paperclip API key will be written to{" "}
+          <code className="break-all">{displayPath}</code>. Nothing for you to
+          copy-paste.
+        </div>
+      </div>
+    );
+  }
+
+  // File exists
+  if (d.scope === "shared") {
+    return (
+      <div className="rounded-md border bg-muted/30 p-3 text-xs space-y-2">
+        <div className="font-medium">Existing API key file found</div>
+        <div className="text-muted-foreground">
+          <code className="break-all">{displayPath}</code>
+          {status.lastModified && <> · modified {relative(status.lastModified)}</>}
+        </div>
+        <div className="text-muted-foreground">
+          This adapter uses one shared key file for every agent it drives, so
+          the same token will serve this imported agent too — no new key
+          needs to be issued.
+        </div>
+        <div className="flex gap-4 pt-1">
+          <label className="flex items-center gap-2">
+            <input
+              type="radio"
+              checked={behavior === "auto"}
+              onChange={() => onChangeBehavior("auto")}
+            />
+            Reuse existing key
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="radio"
+              checked={behavior === "overwrite"}
+              onChange={() => onChangeBehavior("overwrite")}
+            />
+            Replace with a fresh key
+          </label>
+        </div>
+        {behavior === "overwrite" && (
+          <div className="text-amber-700 dark:text-amber-400">
+            ⚠ Replacing will invalidate any previous agents sharing this key.
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // per-agent scope
+  return (
+    <div className="rounded-md border bg-muted/30 p-3 text-xs space-y-1">
+      <div className="font-medium">Existing per-agent key file found</div>
+      <div className="text-muted-foreground">
+        <code className="break-all">{displayPath}</code>
+      </div>
+      <div className="text-muted-foreground">
+        A new key will be issued and written, replacing the previous file.
+      </div>
+    </div>
+  );
+}
+
+function relative(isoTimestamp: string): string {
+  const then = new Date(isoTimestamp).getTime();
+  const now = Date.now();
+  const seconds = Math.round((now - then) / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  return `${days}d ago`;
 }
 
 function humanizeDiscoveryError(err: DiscoveryErrorState): string {

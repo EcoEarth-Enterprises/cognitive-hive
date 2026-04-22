@@ -260,6 +260,46 @@ Heartbeat / execute failures already surface in the status column. Add logic:
 
 The repair-mode submit endpoint can be `PATCH /api/agents/{id}/adapter-config` — this may already exist or need adding; to be determined in implementation phase 6.
 
+### Per-adapter API key storage (Phase 8)
+
+Rather than always issuing a new paperclip API key on import, each adapter now
+declares **where its paperclip key is stored**, via a new optional method on
+`ServerAdapterModule`:
+
+```ts
+getApiKeyStorage?(input: { adapterConfig: Record<string, unknown> }): ApiKeyStorageDescriptor | null;
+
+type ApiKeyStorageDescriptor =
+  | { kind: "file"; path: string; scope: "shared" | "per-agent"; format?: "json_paperclipApiKey" }
+  | { kind: "env"; variable: string }
+  | { kind: "none" };
+```
+
+The server endpoint `POST /api/adapters/:type/api-key-storage` resolves the
+descriptor and reports whether the target file exists. The import endpoint
+accepts a `keyBehavior: "auto" | "reuse_existing" | "overwrite"` and branches:
+
+| descriptor | behavior | file exists | server action |
+|---|---|---|---|
+| `file`, scope `shared` | `auto` | yes | reuse, no issuance |
+| `file`, scope `shared` | `auto` | no | issue + atomically write |
+| `file`, scope `shared` | `overwrite` | any | issue + atomically write |
+| `file`, scope `shared` | `reuse_existing` | any | reuse, no issuance |
+| `file`, scope `per-agent` | `auto` | any | issue + atomically write |
+| `env` | any | n/a | issue and return token once for manual env-var setup |
+| `none` | any | n/a | skip |
+
+**Server-side file writes** are atomic (write to `.tmp`, rename into place)
+with mode `0o600`. Parent dirs are created as needed. Write failures do
+**not** fail the import — the outcome carries `writeStatus: "failed"`
+and a `fallbackToken` so the UI can surface a manual copy-paste flow.
+
+**OpenClaw adapter** declares `scope: "shared"` pointing at
+`~/.openclaw/workspace/paperclip-claimed-api-key.json`, matching upstream
+OpenClaw's current single-file convention. Future upgrade path: when
+upstream OpenClaw supports per-agent key paths, flip `scope` to
+`"per-agent"` and interpolate `adapterConfig.agentId` into the path.
+
 ### Security / privacy
 
 - `adapterConfig` is JSONB-plaintext at rest in pg (not encrypted). The import form should strongly encourage `${SECRET_NAME}` references for any token fields, with inline help text explaining the difference. Raw token paste remains allowed (parity with existing `/agents/new`) but flagged with a warning icon + tooltip.

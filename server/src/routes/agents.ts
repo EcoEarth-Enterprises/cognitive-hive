@@ -48,6 +48,7 @@ import {
 } from "../services/index.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
+import { handleApiKeyStorage } from "./agent-import-key-storage.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
@@ -1649,6 +1650,16 @@ export function agentRoutes(db: Db) {
     const autoApprove = requiresApproval && actor.actorType === "user";
     const status = requiresApproval && !autoApprove ? "pending_approval" : "idle";
 
+    // Resolve adapter-declared API key storage BEFORE creating the agent so we
+    // can decide whether to auto-issue a key (and potentially reuse an existing
+    // file in a shared-scope adapter).
+    const keyBehavior: "auto" | "reuse_existing" | "overwrite" =
+      (req.body.keyBehavior as "auto" | "reuse_existing" | "overwrite" | undefined) ?? "auto";
+    const storageDescriptor =
+      adapter.getApiKeyStorage?.({ adapterConfig: normalizedAdapterConfig as Record<string, unknown> }) ?? {
+        kind: "none" as const,
+      };
+
     const createdAgent = await svc.create(companyId, {
       ...normalizedHireInput,
       status,
@@ -1657,8 +1668,14 @@ export function agentRoutes(db: Db) {
     });
     const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent);
 
-    // Auto-issue a paperclip API key so the external runtime can heartbeat immediately.
-    const apiKey = await svc.createApiKey(agent.id, "import");
+    // Decide API key handling based on the descriptor, keyBehavior, and
+    // whether a file already exists (for "file" descriptors).
+    const keyOutcome = await handleApiKeyStorage({
+      descriptor: storageDescriptor,
+      behavior: keyBehavior,
+      agentId: agent.id,
+      issueKey: (name) => svc.createApiKey(agent.id, name),
+    });
 
     let approval: Awaited<ReturnType<typeof approvalsSvc.getById>> | null = null;
     if (requiresApproval) {
@@ -1766,17 +1783,36 @@ export function agentRoutes(db: Db) {
       });
     }
 
-    await logActivity(db, {
-      companyId,
-      actorType: "user",
-      actorId: actor.actorId,
-      action: "agent.key_created",
-      entityType: "agent",
-      entityId: agent.id,
-      details: { keyId: apiKey.id, name: apiKey.name, source: "import" },
-    });
+    if (keyOutcome.issuedApiKey) {
+      await logActivity(db, {
+        companyId,
+        actorType: "user",
+        actorId: actor.actorId,
+        action: "agent.key_created",
+        entityType: "agent",
+        entityId: agent.id,
+        details: {
+          keyId: keyOutcome.issuedApiKey.id,
+          name: keyOutcome.issuedApiKey.name,
+          source: "import",
+          keyAction: keyOutcome.action,
+          keyPath: keyOutcome.path,
+          writeStatus: keyOutcome.writeStatus,
+        },
+      });
+    }
 
-    res.status(201).json({ agent, apiKey, approval });
+    res.status(201).json({
+      agent,
+      approval,
+      keyAction: keyOutcome.action,
+      keyPath: keyOutcome.path,
+      writeStatus: keyOutcome.writeStatus,
+      writeError: keyOutcome.writeError,
+      // Only returned when the server couldn't write the file — operator has
+      // to paste manually in that case. Never included on successful writes.
+      fallbackToken: keyOutcome.fallbackToken,
+    });
   });
 
   router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {

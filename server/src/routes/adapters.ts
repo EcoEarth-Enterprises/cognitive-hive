@@ -17,6 +17,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { promisify } from "node:util";
 import { Router } from "express";
 import {
@@ -117,6 +118,13 @@ function readAdapterPackageVersionFromDisk(record: AdapterPluginRecord): string 
   } catch {
     return undefined;
   }
+}
+
+function expandTildePath(input: string): string {
+  const trimmed = input.trim();
+  if (trimmed === "~") return os.homedir();
+  if (trimmed.startsWith("~/")) return path.resolve(os.homedir(), trimmed.slice(2));
+  return path.resolve(trimmed);
 }
 
 function discoveryErrorKindToStatus(kind: DiscoveryErrorKind): number {
@@ -739,6 +747,63 @@ export function adapterRoutes() {
         kind: "internal" satisfies DiscoveryErrorKind,
       });
     }
+  });
+
+  // ── POST /api/adapters/:type/api-key-storage ─────────────────────────────
+  // Resolve the paperclip API key storage descriptor for an adapter given
+  // specific adapter config, and check whether a key file already exists
+  // (for "file" descriptors). Used by the import flow to decide whether to
+  // auto-issue+write a new token, reuse an existing one, or skip.
+  //
+  // Request body: { adapterConfig: Record<string, unknown> }
+  // Response:
+  //   { descriptor: ApiKeyStorageDescriptor, exists: boolean,
+  //     absolutePath?: string, lastModified?: string }
+  //   or { descriptor: { kind: "none" }, exists: false } when the adapter
+  //   does not implement getApiKeyStorage at all.
+  router.post("/adapters/:type/api-key-storage", async (req, res) => {
+    assertBoardOrgAccess(req);
+    const { type } = req.params;
+
+    const adapter = findActiveServerAdapter(type);
+    if (!adapter) {
+      res.status(404).json({ error: `Adapter "${type}" is not registered.` });
+      return;
+    }
+
+    const body = (req.body ?? {}) as { adapterConfig?: unknown };
+    const adapterConfig =
+      body.adapterConfig && typeof body.adapterConfig === "object" && !Array.isArray(body.adapterConfig)
+        ? (body.adapterConfig as Record<string, unknown>)
+        : {};
+
+    const descriptor = adapter.getApiKeyStorage?.({ adapterConfig }) ?? { kind: "none" as const };
+
+    if (descriptor.kind === "file") {
+      const absolutePath = expandTildePath(descriptor.path);
+      try {
+        const stat = await fs.promises.stat(absolutePath);
+        res.json({
+          descriptor,
+          exists: stat.isFile(),
+          absolutePath,
+          lastModified: stat.isFile() ? stat.mtime.toISOString() : undefined,
+        });
+        return;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") {
+          res.json({ descriptor, exists: false, absolutePath });
+          return;
+        }
+        res.status(500).json({
+          error: `Failed to inspect API key path: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        return;
+      }
+    }
+
+    res.json({ descriptor, exists: false });
   });
 
   // ── GET /api/adapters/:type/ui-parser.js ─────────────────────────────────

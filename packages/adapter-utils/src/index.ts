@@ -30,6 +30,8 @@ export type {
   DiscoverAgentsInput,
   DiscoverAgentsResult,
   DiscoveryErrorKind,
+  ApiKeyStorageDescriptor,
+  GetApiKeyStorageInput,
   QuotaWindow,
   ProviderQuotaResult,
   TranscriptEntry,

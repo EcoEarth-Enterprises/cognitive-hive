@@ -92,4 +92,24 @@ export const adaptersApi = {
    */
   discover: (type: string, connectionConfig: Record<string, unknown>) =>
     api.post<DiscoverAgentsResult>(`/adapters/${type}/discover`, { connectionConfig }),
+
+  /**
+   * Resolve the adapter's paperclip API-key storage descriptor and check
+   * whether an on-disk key file already exists. Used by /agents/import to
+   * decide whether to auto-issue+write a new key or reuse the existing one.
+   */
+  apiKeyStorage: (type: string, adapterConfig: Record<string, unknown>) =>
+    api.post<ApiKeyStorageStatus>(`/adapters/${type}/api-key-storage`, { adapterConfig }),
 };
+
+export type ApiKeyStorageDescriptor =
+  | { kind: "file"; path: string; scope: "shared" | "per-agent"; format?: "json_paperclipApiKey" }
+  | { kind: "env"; variable: string }
+  | { kind: "none" };
+
+export interface ApiKeyStorageStatus {
+  descriptor: ApiKeyStorageDescriptor;
+  exists: boolean;
+  absolutePath?: string;
+  lastModified?: string;
+}

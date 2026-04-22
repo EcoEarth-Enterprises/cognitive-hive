@@ -51,6 +51,7 @@ import {
   execute as openclawGatewayExecute,
   testEnvironment as openclawGatewayTestEnvironment,
   discoverAgents as openclawGatewayDiscoverAgents,
+  getApiKeyStorage as openclawGatewayGetApiKeyStorage,
 } from "@paperclipai/adapter-openclaw-gateway/server";
 import {
   agentConfigurationDoc as openclawGatewayAgentConfigurationDoc,
@@ -192,6 +193,7 @@ const openclawGatewayAdapter: ServerAdapterModule = {
   execute: openclawGatewayExecute,
   testEnvironment: openclawGatewayTestEnvironment,
   discoverAgents: openclawGatewayDiscoverAgents,
+  getApiKeyStorage: openclawGatewayGetApiKeyStorage,
   models: openclawGatewayModels,
   supportsLocalAgentJwt: false,
   supportsInstructionsBundle: false,

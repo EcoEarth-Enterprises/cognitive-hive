@@ -59,13 +59,20 @@ export interface AgentHireResponse {
 
 export interface AgentImportResponse {
   agent: Agent;
-  apiKey: {
-    id: string;
-    name: string;
-    token: string;
-    createdAt: string;
-  };
   approval: Approval | null;
+  /** Summary of what the import endpoint did about the adapter's API key storage. */
+  keyAction:
+    | "reused_existing"
+    | "issued_and_written"
+    | "overwritten"
+    | "issued_no_storage"
+    | "skipped";
+  /** Absolute path the server wrote to (when descriptor.kind === "file"). */
+  keyPath?: string;
+  writeStatus?: "wrote" | "skipped_existing" | "failed";
+  writeError?: string;
+  /** Only set when the server attempted to write but failed — UI shows copy-manually fallback. */
+  fallbackToken?: string;
 }
 
 export interface AgentPermissionUpdate {

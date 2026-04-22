@@ -68,12 +68,22 @@ IMPORT_RESP="$(curl -sS -f -X POST "${API_BASE}/companies/${COMPANY_ID}/agent-im
     '{name:$name, role:$role, adapterType:"openclaw_gateway", adapterConfig:{url:$url, agentId:$agentId}}')")"
 
 IMPORTED_AGENT_ID="$(echo "$IMPORT_RESP" | jq -r '.agent.id')"
-API_KEY_TOKEN="$(echo "$IMPORT_RESP" | jq -r '.apiKey.token')"
+KEY_ACTION="$(echo "$IMPORT_RESP" | jq -r '.keyAction // "skipped"')"
+KEY_PATH="$(echo "$IMPORT_RESP" | jq -r '.keyPath // ""')"
+WRITE_STATUS="$(echo "$IMPORT_RESP" | jq -r '.writeStatus // ""')"
 APPROVAL_STATUS="$(echo "$IMPORT_RESP" | jq -r '.approval.status // "none"')"
 
 echo "   agent.id=$IMPORTED_AGENT_ID"
 echo "   approval.status=$APPROVAL_STATUS"
-echo "   apiKey.token=${API_KEY_TOKEN:0:12}…(redacted)"
+echo "   keyAction=$KEY_ACTION (writeStatus=${WRITE_STATUS:-n/a})"
+if [[ -n "$KEY_PATH" ]]; then
+  echo "   keyPath=$KEY_PATH"
+fi
+FALLBACK_TOKEN="$(echo "$IMPORT_RESP" | jq -r '.fallbackToken // ""')"
+if [[ -n "$FALLBACK_TOKEN" ]]; then
+  echo "   ⚠ fallbackToken returned — server could not write the key file."
+  echo "     Save it to \$keyPath as: {\"paperclipApiKey\":\"<token>\"}"
+fi
 
 echo ""
 echo "3. Verifying agent record"

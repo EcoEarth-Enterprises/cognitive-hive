@@ -33,5 +33,7 @@ export type {
   DiscoverAgentsInput,
   DiscoverAgentsResult,
   DiscoveryErrorKind,
+  ApiKeyStorageDescriptor,
+  GetApiKeyStorageInput,
 } from "@paperclipai/adapter-utils";
 export { DiscoveryError } from "@paperclipai/adapter-utils";
