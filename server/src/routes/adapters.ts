@@ -40,7 +40,8 @@ import {
   setAdapterDisabled,
 } from "../services/adapter-plugin-store.js";
 import type { AdapterPluginRecord } from "../services/adapter-plugin-store.js";
-import type { ServerAdapterModule, AdapterConfigSchema } from "../adapters/types.js";
+import type { ServerAdapterModule, AdapterConfigSchema, DiscoveryErrorKind } from "../adapters/types.js";
+import { DiscoveryError } from "../adapters/types.js";
 import { loadExternalAdapterPackage, getUiParserSource, getOrExtractUiParserSource, reloadExternalAdapter } from "../adapters/plugin-loader.js";
 import { logger } from "../middleware/logger.js";
 import { assertBoardOrgAccess, assertInstanceAdmin } from "./authz.js";
@@ -115,6 +116,22 @@ function readAdapterPackageVersionFromDisk(record: AdapterPluginRecord): string 
     return typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
   } catch {
     return undefined;
+  }
+}
+
+function discoveryErrorKindToStatus(kind: DiscoveryErrorKind): number {
+  switch (kind) {
+    case "invalid_config":
+      return 400;
+    case "unauthorized":
+      return 401;
+    case "unreachable":
+      return 502;
+    case "not_supported":
+      return 501;
+    case "internal":
+    default:
+      return 500;
   }
 }
 
@@ -653,6 +670,74 @@ export function adapterRoutes() {
       const message = err instanceof Error ? err.message : String(err);
       logger.error({ err, type }, "Failed to resolve config schema");
       res.status(500).json({ error: `Failed to resolve config schema: ${message}` });
+    }
+  });
+
+  // ── POST /api/adapters/:type/discover ────────────────────────────────────
+  // Invoke the adapter's discoverAgents() method to enumerate existing agents
+  // on an external runtime (the "hire existing" discovery step).
+  //
+  // Request body: { connectionConfig: Record<string, unknown> } — typically
+  //   { url, headers? } for gateway-style adapters. The adapter implementation
+  //   decides which fields it reads.
+  //
+  // Response: DiscoverAgentsResult — { agents: DiscoveredAgent[], warnings? }
+  //
+  // Errors are mapped from DiscoveryError.kind to HTTP status:
+  //   invalid_config  -> 400
+  //   unauthorized    -> 401
+  //   unreachable     -> 502
+  //   not_supported   -> 501
+  //   internal        -> 500
+  router.post("/adapters/:type/discover", async (req, res) => {
+    assertBoardOrgAccess(req);
+    const { type } = req.params;
+
+    const adapter = findActiveServerAdapter(type);
+    if (!adapter) {
+      res.status(404).json({ error: `Adapter "${type}" is not registered.` });
+      return;
+    }
+    if (!adapter.discoverAgents) {
+      res.status(501).json({
+        error: `Adapter "${type}" does not implement discovery.`,
+        kind: "not_supported" satisfies DiscoveryErrorKind,
+      });
+      return;
+    }
+
+    const body = (req.body ?? {}) as { connectionConfig?: unknown };
+    const connectionConfig =
+      body.connectionConfig && typeof body.connectionConfig === "object" && !Array.isArray(body.connectionConfig)
+        ? (body.connectionConfig as Record<string, unknown>)
+        : null;
+    if (!connectionConfig) {
+      res.status(400).json({
+        error: "Request body must include connectionConfig as an object.",
+        kind: "invalid_config" satisfies DiscoveryErrorKind,
+      });
+      return;
+    }
+
+    try {
+      const result = await adapter.discoverAgents({ connectionConfig });
+      res.json(result);
+    } catch (err) {
+      if (err instanceof DiscoveryError) {
+        const status = discoveryErrorKindToStatus(err.kind);
+        res.status(status).json({
+          error: err.message,
+          kind: err.kind,
+          details: err.details,
+        });
+        return;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error({ err, type }, "Adapter discovery failed with unexpected error");
+      res.status(500).json({
+        error: `Discovery failed: ${message}`,
+        kind: "internal" satisfies DiscoveryErrorKind,
+      });
     }
   });
 
