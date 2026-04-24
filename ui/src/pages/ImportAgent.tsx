@@ -272,12 +272,22 @@ export function ImportAgent() {
           url={url}
           setUrl={setUrl}
           onBack={() => setStep("adapter")}
-          onDiscover={() => discoverMutation.mutate()}
+          onDiscover={() => {
+            // Normalize the URL before dispatching so the agent's stored
+            // adapterConfig can never end up with a wrong protocol.
+            const normalized = normalizeRuntimeUrl(adapterType, url);
+            if (normalized !== url) setUrl(normalized);
+            discoverMutation.mutate();
+          }}
           discovering={discoverMutation.isPending}
           result={discoveryResult}
           warnings={discoveryWarnings}
           error={discoveryError}
           onPickAgent={pickDiscoveredAgent}
+          onUrlBlur={() => {
+            const normalized = normalizeRuntimeUrl(adapterType, url);
+            if (normalized !== url) setUrl(normalized);
+          }}
         />
       )}
 
@@ -476,6 +486,7 @@ function DiscoverStep({
   warnings,
   error,
   onPickAgent,
+  onUrlBlur,
 }: {
   adapterType: string;
   url: string;
@@ -487,7 +498,9 @@ function DiscoverStep({
   warnings: string[];
   error: DiscoveryErrorState | null;
   onPickAgent: (agent: DiscoveredAgent) => void;
+  onUrlBlur: () => void;
 }) {
+  const needsWsProtocol = adapterType === "openclaw_gateway";
   return (
     <Card>
       <CardHeader>
@@ -498,10 +511,17 @@ function DiscoverStep({
           <Label htmlFor="runtime-url">Runtime URL ({adapterType})</Label>
           <Input
             id="runtime-url"
-            placeholder="ws://127.0.0.1:18789"
+            placeholder={needsWsProtocol ? "ws://127.0.0.1:18789" : "http://127.0.0.1:18789"}
             value={url}
             onChange={(e) => setUrl(e.target.value)}
+            onBlur={onUrlBlur}
           />
+          {needsWsProtocol && (
+            <p className="text-xs text-muted-foreground">
+              OpenClaw uses WebSockets — paste either <code>ws://</code> or{" "}
+              <code>http://</code> and we'll normalize it.
+            </p>
+          )}
         </div>
         <div className="flex justify-between">
           <Button variant="ghost" onClick={onBack}>← Back</Button>
@@ -805,6 +825,23 @@ function relative(isoTimestamp: string): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.round(hours / 24);
   return `${days}d ago`;
+}
+
+/**
+ * Normalize a runtime URL to the protocol the adapter actually uses.
+ *
+ * For openclaw_gateway specifically, the adapter speaks WebSocket, but users
+ * routinely type `http://` (because they got there via a browser). Rewrite to
+ * `ws://` / `wss://` so we never persist a config that will fail at heartbeat.
+ */
+function normalizeRuntimeUrl(adapterType: string, input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) return trimmed;
+  if (adapterType === "openclaw_gateway") {
+    if (trimmed.startsWith("http://")) return "ws://" + trimmed.slice("http://".length);
+    if (trimmed.startsWith("https://")) return "wss://" + trimmed.slice("https://".length);
+  }
+  return trimmed;
 }
 
 function humanizeDiscoveryError(err: DiscoveryErrorState): string {

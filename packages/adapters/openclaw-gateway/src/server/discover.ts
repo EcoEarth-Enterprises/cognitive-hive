@@ -27,6 +27,19 @@ export async function discoverAgents(input: DiscoverAgentsInput): Promise<Discov
     throw new DiscoveryError("invalid_config", "Gateway URL is required for discovery.");
   }
 
+  // The openclaw gateway speaks WebSocket. Reject http(s):// up front so we
+  // never persist a config that will fail at heartbeat with
+  // "Unsupported gateway URL protocol". The import UI auto-normalizes
+  // http→ws, but a raw API caller could still try to submit http://.
+  const protocol = protocolOf(url);
+  if (protocol !== null && protocol !== "ws:" && protocol !== "wss:") {
+    throw new DiscoveryError(
+      "invalid_config",
+      `OpenClaw gateway URLs must use ws:// or wss://. Received "${protocol}". Did you mean "${url.replace(/^http/, "ws")}"?`,
+      { url, protocol },
+    );
+  }
+
   if (!isLoopbackUrl(url)) {
     throw new DiscoveryError(
       "not_supported",
@@ -36,6 +49,14 @@ export async function discoverAgents(input: DiscoverAgentsInput): Promise<Discov
   }
 
   return discoverViaFilesystem();
+}
+
+function protocolOf(url: string): string | null {
+  try {
+    return new URL(url).protocol;
+  } catch {
+    return null;
+  }
 }
 
 function extractUrl(config: Record<string, unknown>): string | null {
