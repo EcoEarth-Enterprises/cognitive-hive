@@ -61,6 +61,9 @@ pnpm dev
 
 ## 5. Core Engineering Rules
 
+0. **All work lands through a PR. Never commit or push to `master`.**
+   Every change — no matter how small — starts with `git checkout -b <prefix>/<slug>` where `<prefix>` is one of `feat`, `fix`, `chore`, `docs`, `test`, or `refactor`. Commit on the branch, `git push -u origin <branch>`, then open a PR against `master` (`gh pr create --base master --head <branch>`). Direct commits or pushes to `master` are forbidden regardless of how trivial the change feels. If a user asks you to "commit and push" without naming a branch, branch off first — that instruction is never a license to push to `master`.
+
 1. Keep changes company-scoped.
 Every domain entity should be scoped to a company and company boundaries must be enforced in routes/services.
 
