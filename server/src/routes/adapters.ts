@@ -17,6 +17,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { promisify } from "node:util";
 import { Router } from "express";
 import {
@@ -40,7 +41,8 @@ import {
   setAdapterDisabled,
 } from "../services/adapter-plugin-store.js";
 import type { AdapterPluginRecord } from "../services/adapter-plugin-store.js";
-import type { ServerAdapterModule, AdapterConfigSchema } from "../adapters/types.js";
+import type { ServerAdapterModule, AdapterConfigSchema, DiscoveryErrorKind } from "../adapters/types.js";
+import { DiscoveryError } from "../adapters/types.js";
 import { loadExternalAdapterPackage, getUiParserSource, getOrExtractUiParserSource, reloadExternalAdapter } from "../adapters/plugin-loader.js";
 import { logger } from "../middleware/logger.js";
 import { assertBoardOrgAccess, assertInstanceAdmin } from "./authz.js";
@@ -66,6 +68,11 @@ interface AdapterCapabilities {
   supportsSkills: boolean;
   supportsLocalAgentJwt: boolean;
   requiresMaterializedRuntimeSkills: boolean;
+  /**
+   * True when the adapter implements discoverAgents() and can enumerate
+   * existing external agents for the "hire existing" UI flow.
+   */
+  supportsDiscovery: boolean;
 }
 
 interface AdapterInfo {
@@ -113,12 +120,36 @@ function readAdapterPackageVersionFromDisk(record: AdapterPluginRecord): string 
   }
 }
 
+function expandTildePath(input: string): string {
+  const trimmed = input.trim();
+  if (trimmed === "~") return os.homedir();
+  if (trimmed.startsWith("~/")) return path.resolve(os.homedir(), trimmed.slice(2));
+  return path.resolve(trimmed);
+}
+
+function discoveryErrorKindToStatus(kind: DiscoveryErrorKind): number {
+  switch (kind) {
+    case "invalid_config":
+      return 400;
+    case "unauthorized":
+      return 401;
+    case "unreachable":
+      return 502;
+    case "not_supported":
+      return 501;
+    case "internal":
+    default:
+      return 500;
+  }
+}
+
 function buildAdapterCapabilities(adapter: ServerAdapterModule): AdapterCapabilities {
   return {
     supportsInstructionsBundle: adapter.supportsInstructionsBundle ?? false,
     supportsSkills: Boolean(adapter.listSkills || adapter.syncSkills),
     supportsLocalAgentJwt: adapter.supportsLocalAgentJwt ?? false,
     requiresMaterializedRuntimeSkills: adapter.requiresMaterializedRuntimeSkills ?? false,
+    supportsDiscovery: Boolean(adapter.discoverAgents),
   };
 }
 
@@ -648,6 +679,131 @@ export function adapterRoutes() {
       logger.error({ err, type }, "Failed to resolve config schema");
       res.status(500).json({ error: `Failed to resolve config schema: ${message}` });
     }
+  });
+
+  // ── POST /api/adapters/:type/discover ────────────────────────────────────
+  // Invoke the adapter's discoverAgents() method to enumerate existing agents
+  // on an external runtime (the "hire existing" discovery step).
+  //
+  // Request body: { connectionConfig: Record<string, unknown> } — typically
+  //   { url, headers? } for gateway-style adapters. The adapter implementation
+  //   decides which fields it reads.
+  //
+  // Response: DiscoverAgentsResult — { agents: DiscoveredAgent[], warnings? }
+  //
+  // Errors are mapped from DiscoveryError.kind to HTTP status:
+  //   invalid_config  -> 400
+  //   unauthorized    -> 401
+  //   unreachable     -> 502
+  //   not_supported   -> 501
+  //   internal        -> 500
+  router.post("/adapters/:type/discover", async (req, res) => {
+    assertBoardOrgAccess(req);
+    const { type } = req.params;
+
+    const adapter = findActiveServerAdapter(type);
+    if (!adapter) {
+      res.status(404).json({ error: `Adapter "${type}" is not registered.` });
+      return;
+    }
+    if (!adapter.discoverAgents) {
+      res.status(501).json({
+        error: `Adapter "${type}" does not implement discovery.`,
+        kind: "not_supported" satisfies DiscoveryErrorKind,
+      });
+      return;
+    }
+
+    const body = (req.body ?? {}) as { connectionConfig?: unknown };
+    const connectionConfig =
+      body.connectionConfig && typeof body.connectionConfig === "object" && !Array.isArray(body.connectionConfig)
+        ? (body.connectionConfig as Record<string, unknown>)
+        : null;
+    if (!connectionConfig) {
+      res.status(400).json({
+        error: "Request body must include connectionConfig as an object.",
+        kind: "invalid_config" satisfies DiscoveryErrorKind,
+      });
+      return;
+    }
+
+    try {
+      const result = await adapter.discoverAgents({ connectionConfig });
+      res.json(result);
+    } catch (err) {
+      if (err instanceof DiscoveryError) {
+        const status = discoveryErrorKindToStatus(err.kind);
+        res.status(status).json({
+          error: err.message,
+          kind: err.kind,
+          details: err.details,
+        });
+        return;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error({ err, type }, "Adapter discovery failed with unexpected error");
+      res.status(500).json({
+        error: `Discovery failed: ${message}`,
+        kind: "internal" satisfies DiscoveryErrorKind,
+      });
+    }
+  });
+
+  // ── POST /api/adapters/:type/api-key-storage ─────────────────────────────
+  // Resolve the paperclip API key storage descriptor for an adapter given
+  // specific adapter config, and check whether a key file already exists
+  // (for "file" descriptors). Used by the import flow to decide whether to
+  // auto-issue+write a new token, reuse an existing one, or skip.
+  //
+  // Request body: { adapterConfig: Record<string, unknown> }
+  // Response:
+  //   { descriptor: ApiKeyStorageDescriptor, exists: boolean,
+  //     absolutePath?: string, lastModified?: string }
+  //   or { descriptor: { kind: "none" }, exists: false } when the adapter
+  //   does not implement getApiKeyStorage at all.
+  router.post("/adapters/:type/api-key-storage", async (req, res) => {
+    assertBoardOrgAccess(req);
+    const { type } = req.params;
+
+    const adapter = findActiveServerAdapter(type);
+    if (!adapter) {
+      res.status(404).json({ error: `Adapter "${type}" is not registered.` });
+      return;
+    }
+
+    const body = (req.body ?? {}) as { adapterConfig?: unknown };
+    const adapterConfig =
+      body.adapterConfig && typeof body.adapterConfig === "object" && !Array.isArray(body.adapterConfig)
+        ? (body.adapterConfig as Record<string, unknown>)
+        : {};
+
+    const descriptor = adapter.getApiKeyStorage?.({ adapterConfig }) ?? { kind: "none" as const };
+
+    if (descriptor.kind === "file") {
+      const absolutePath = expandTildePath(descriptor.path);
+      try {
+        const stat = await fs.promises.stat(absolutePath);
+        res.json({
+          descriptor,
+          exists: stat.isFile(),
+          absolutePath,
+          lastModified: stat.isFile() ? stat.mtime.toISOString() : undefined,
+        });
+        return;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") {
+          res.json({ descriptor, exists: false, absolutePath });
+          return;
+        }
+        res.status(500).json({
+          error: `Failed to inspect API key path: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        return;
+      }
+    }
+
+    res.json({ descriptor, exists: false });
   });
 
   // ── GET /api/adapters/:type/ui-parser.js ─────────────────────────────────

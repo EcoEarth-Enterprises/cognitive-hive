@@ -26,6 +26,12 @@ export type {
   ConfigFieldSchema,
   AdapterConfigSchema,
   ServerAdapterModule,
+  DiscoveredAgent,
+  DiscoverAgentsInput,
+  DiscoverAgentsResult,
+  DiscoveryErrorKind,
+  ApiKeyStorageDescriptor,
+  GetApiKeyStorageInput,
   QuotaWindow,
   ProviderQuotaResult,
   TranscriptEntry,
@@ -54,3 +60,4 @@ export {
   redactTranscriptEntryPaths,
 } from "./log-redaction.js";
 export { inferOpenAiCompatibleBiller } from "./billing.js";
+export { DiscoveryError } from "./types.js";

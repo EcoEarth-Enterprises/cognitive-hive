@@ -65,6 +65,18 @@ export type CreateAgent = z.infer<typeof createAgentSchema>;
 export const createAgentHireSchema = createAgentSchema.extend({
   sourceIssueId: z.string().uuid().optional().nullable(),
   sourceIssueIds: z.array(z.string().uuid()).optional(),
+  /**
+   * How the import endpoint should handle paperclip API-key storage for the
+   * imported agent. Ignored by /agent-hires (fresh-spawn flow doesn't write
+   * adapter-side key files).
+   *
+   *  - "auto" (default): issue a new key and write to the adapter-declared
+   *    path if the file doesn't already exist; reuse the existing file when
+   *    the adapter declares "shared" scope and the file is present.
+   *  - "reuse_existing": never issue a new key, never touch the file.
+   *  - "overwrite": always issue a new key and overwrite the file.
+   */
+  keyBehavior: z.enum(["auto", "reuse_existing", "overwrite"]).optional().default("auto"),
 });
 
 export type CreateAgentHire = z.infer<typeof createAgentHireSchema>;

@@ -57,6 +57,24 @@ export interface AgentHireResponse {
   approval: Approval | null;
 }
 
+export interface AgentImportResponse {
+  agent: Agent;
+  approval: Approval | null;
+  /** Summary of what the import endpoint did about the adapter's API key storage. */
+  keyAction:
+    | "reused_existing"
+    | "issued_and_written"
+    | "overwritten"
+    | "issued_no_storage"
+    | "skipped";
+  /** Absolute path the server wrote to (when descriptor.kind === "file"). */
+  keyPath?: string;
+  writeStatus?: "wrote" | "skipped_existing" | "failed";
+  writeError?: string;
+  /** Only set when the server attempted to write but failed — UI shows copy-manually fallback. */
+  fallbackToken?: string;
+}
+
 export interface AgentPermissionUpdate {
   canCreateAgents: boolean;
   canAssignTasks: boolean;
@@ -115,6 +133,8 @@ export const agentsApi = {
     api.post<Agent>(`/companies/${companyId}/agents`, data),
   hire: (companyId: string, data: Record<string, unknown>) =>
     api.post<AgentHireResponse>(`/companies/${companyId}/agent-hires`, data),
+  importExisting: (companyId: string, data: Record<string, unknown>) =>
+    api.post<AgentImportResponse>(`/companies/${companyId}/agent-imports`, data),
   update: (id: string, data: Record<string, unknown>, companyId?: string) =>
     api.patch<Agent>(agentPath(id, companyId), data),
   updatePermissions: (id: string, data: AgentPermissionUpdate, companyId?: string) =>

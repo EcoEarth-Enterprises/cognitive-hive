@@ -289,12 +289,118 @@ export interface AdapterConfigSchema {
   fields: ConfigFieldSchema[];
 }
 
+/**
+ * A single agent enumerated from an external runtime during the "hire existing"
+ * discovery step. Shape is intentionally minimal — the UI renders a picker list
+ * from these entries.
+ */
+export interface DiscoveredAgent {
+  /** Stable id the external runtime uses to address this agent. */
+  id: string;
+  /** Human-readable name. */
+  name: string;
+  /** Optional — role/title/description shown next to each option. */
+  description?: string;
+  /** Optional — current status hint from the external runtime. */
+  status?: "idle" | "running" | "error" | "unknown";
+  /** Optional — arbitrary metadata passed through to the UI. */
+  metadata?: Record<string, unknown>;
+}
+
+export interface DiscoverAgentsInput {
+  /**
+   * The minimum config needed to reach the external runtime. For openclaw_gateway
+   * this is `{ url, headers? }`. The adapter's getConfigSchema() declares which
+   * fields belong in the "connection" subset; the server forwards only those.
+   */
+  connectionConfig: Record<string, unknown>;
+}
+
+export interface DiscoverAgentsResult {
+  agents: DiscoveredAgent[];
+  /** Optional hints for the UI when the list is empty, truncated, or partial. */
+  warnings?: string[];
+}
+
+/**
+ * Discriminant for discovery failures. Lets the server map to appropriate
+ * HTTP status codes and the UI render specific messages.
+ */
+export type DiscoveryErrorKind =
+  | "unreachable"
+  | "unauthorized"
+  | "not_supported"
+  | "invalid_config"
+  | "internal";
+
+/**
+ * Typed error an adapter's discoverAgents() implementation should throw on
+ * failure. The server's discovery route checks `kind` to pick an HTTP status;
+ * any non-DiscoveryError is treated as an "internal" error.
+ */
+export class DiscoveryError extends Error {
+  public readonly kind: DiscoveryErrorKind;
+  public readonly details?: Record<string, unknown>;
+  constructor(kind: DiscoveryErrorKind, message: string, details?: Record<string, unknown>) {
+    super(message);
+    this.name = "DiscoveryError";
+    this.kind = kind;
+    this.details = details;
+  }
+}
+
+/**
+ * Where a paperclip API key is stored for an adapter's agents to read at
+ * runtime. Declared by each adapter so the import flow can check for an
+ * existing file, auto-write a new one, or skip based on scope semantics.
+ *
+ * - `kind: "file"` — classic pattern where the external runtime reads the
+ *   token from an on-disk JSON file. `scope: "shared"` means every agent
+ *   under this adapter reads the same file (e.g. upstream OpenClaw today).
+ *   `scope: "per-agent"` means each agent's config resolves to its own
+ *   path — imports never collide.
+ * - `kind: "env"` — the external runtime reads the token from a named env
+ *   variable injected at invocation time. Nothing to write at import.
+ * - `kind: "none"` — adapter does not need a paperclip-side API key; import
+ *   UI shows no auth step.
+ */
+export type ApiKeyStorageDescriptor =
+  | { kind: "file"; path: string; scope: "shared" | "per-agent"; format?: "json_paperclipApiKey" }
+  | { kind: "env"; variable: string }
+  | { kind: "none" };
+
+export interface GetApiKeyStorageInput {
+  /** The agent's adapterConfig (url, agentId, headers, etc.) — already validated. */
+  adapterConfig: Record<string, unknown>;
+}
+
 export interface ServerAdapterModule {
   type: string;
   execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
   testEnvironment(ctx: AdapterEnvironmentTestContext): Promise<AdapterEnvironmentTestResult>;
   listSkills?: (ctx: AdapterSkillContext) => Promise<AdapterSkillSnapshot>;
   syncSkills?: (ctx: AdapterSkillContext, desiredSkills: string[]) => Promise<AdapterSkillSnapshot>;
+  /**
+   * Optional. If implemented, the adapter supports "hire existing" discovery:
+   * given connection config (e.g., a gateway URL), enumerate agents that
+   * exist on the external runtime so the operator can pick one to import.
+   *
+   * Implementations must be side-effect-free (no pairing, no state mutation).
+   * Throw a {@link DiscoveryError} to signal typed failures.
+   */
+  discoverAgents?: (input: DiscoverAgentsInput) => Promise<DiscoverAgentsResult>;
+
+  /**
+   * Optional. Declares where the paperclip API key is stored for this
+   * adapter's agents so the import flow can check existing files, auto-write
+   * new keys, or skip auth entirely. Pure function of adapterConfig — must
+   * not touch the filesystem or network.
+   *
+   * Return `null` (or don't implement) when the adapter has no opinion;
+   * the import flow treats that as {@link ApiKeyStorageDescriptor} `kind:
+   * "none"` — no key file will be written and no token will be returned.
+   */
+  getApiKeyStorage?: (input: GetApiKeyStorageInput) => ApiKeyStorageDescriptor | null;
   sessionCodec?: AdapterSessionCodec;
   sessionManagement?: import("./session-compaction.js").AdapterSessionManagement;
   supportsLocalAgentJwt?: boolean;

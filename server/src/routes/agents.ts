@@ -48,6 +48,7 @@ import {
 } from "../services/index.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
+import { handleApiKeyStorage } from "./agent-import-key-storage.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
@@ -1555,6 +1556,263 @@ export function agentRoutes(db: Db) {
     }
 
     res.status(201).json({ agent, approval });
+  });
+
+  /**
+   * POST /api/companies/:companyId/agent-imports
+   *
+   * Hire an existing external agent ("hire existing"). Mirrors /agent-hires but:
+   *   - Requires the adapter to implement discoverAgents() — this endpoint is
+   *     specifically for agents already running on an external runtime.
+   *   - Auto-issues a paperclip API key on success so the external runtime can
+   *     heartbeat back without an extra round-trip.
+   *   - When the company requires approval for new agents, the approval row is
+   *     auto-decided to "approved" by the requester if the requester is a user
+   *     (board-tier). Agent-initiated imports from non-board-tier callers fall
+   *     through to the usual pending-approval flow.
+   *
+   * Response body: { agent, apiKey: { id, name, token, createdAt }, approval? }
+   * The plaintext token is returned once in this response and never again.
+   */
+  router.post("/companies/:companyId/agent-imports", validate(createAgentHireSchema), async (req, res) => {
+    const companyId = req.params.companyId as string;
+    await assertCanCreateAgentsForCompany(req, companyId);
+    const sourceIssueIds = parseSourceIssueIds(req.body);
+    const {
+      desiredSkills: requestedDesiredSkills,
+      sourceIssueId: _sourceIssueId,
+      sourceIssueIds: _sourceIssueIds,
+      ...hireInput
+    } = req.body;
+    hireInput.adapterType = assertKnownAdapterType(hireInput.adapterType);
+
+    const adapter = findActiveServerAdapter(hireInput.adapterType);
+    if (!adapter) {
+      res.status(404).json({ error: `Adapter "${hireInput.adapterType}" is not registered.` });
+      return;
+    }
+    if (!adapter.discoverAgents) {
+      res.status(400).json({
+        error: `Adapter "${hireInput.adapterType}" does not support discovery and cannot be used with agent-imports. Use /agent-hires instead for fresh-spawn adapters.`,
+      });
+      return;
+    }
+
+    assertNoAgentHostWorkspaceCommandMutation(
+      req,
+      collectAgentAdapterWorkspaceCommandPaths(hireInput.adapterConfig),
+    );
+    assertNoAgentInstructionsConfigMutation(
+      req,
+      (hireInput.adapterConfig ?? {}) as Record<string, unknown>,
+    );
+    const requestedAdapterConfig = applyCreateDefaultsByAdapterType(
+      hireInput.adapterType,
+      ((hireInput.adapterConfig ?? {}) as Record<string, unknown>),
+    );
+    const desiredSkillAssignment = await resolveDesiredSkillAssignment(
+      companyId,
+      hireInput.adapterType,
+      requestedAdapterConfig,
+      Array.isArray(requestedDesiredSkills) ? requestedDesiredSkills : undefined,
+    );
+    const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
+      companyId,
+      desiredSkillAssignment.adapterConfig,
+      { strictMode: strictSecretsMode },
+    );
+    await assertAdapterConfigConstraints(
+      companyId,
+      hireInput.adapterType,
+      normalizedAdapterConfig,
+    );
+    const normalizedHireInput = {
+      ...hireInput,
+      adapterConfig: normalizedAdapterConfig,
+      runtimeConfig: normalizeNewAgentRuntimeConfig(hireInput.runtimeConfig),
+    };
+
+    const company = await db
+      .select()
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .then((rows) => rows[0] ?? null);
+    if (!company) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    const requiresApproval = company.requireBoardApprovalForNewAgents;
+    // User-initiated imports from board-tier callers auto-approve; agent-initiated
+    // imports (even with agents:create permission) still go through pending approval
+    // as a governance safety net.
+    const autoApprove = requiresApproval && actor.actorType === "user";
+    const status = requiresApproval && !autoApprove ? "pending_approval" : "idle";
+
+    // Resolve adapter-declared API key storage BEFORE creating the agent so we
+    // can decide whether to auto-issue a key (and potentially reuse an existing
+    // file in a shared-scope adapter).
+    const keyBehavior: "auto" | "reuse_existing" | "overwrite" =
+      (req.body.keyBehavior as "auto" | "reuse_existing" | "overwrite" | undefined) ?? "auto";
+    const storageDescriptor =
+      adapter.getApiKeyStorage?.({ adapterConfig: normalizedAdapterConfig as Record<string, unknown> }) ?? {
+        kind: "none" as const,
+      };
+
+    const createdAgent = await svc.create(companyId, {
+      ...normalizedHireInput,
+      status,
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+    });
+    const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent);
+
+    // Decide API key handling based on the descriptor, keyBehavior, and
+    // whether a file already exists (for "file" descriptors).
+    const keyOutcome = await handleApiKeyStorage({
+      descriptor: storageDescriptor,
+      behavior: keyBehavior,
+      agentId: agent.id,
+      issueKey: (name) => svc.createApiKey(agent.id, name),
+    });
+
+    let approval: Awaited<ReturnType<typeof approvalsSvc.getById>> | null = null;
+    if (requiresApproval) {
+      const requestedAdapterType = normalizedHireInput.adapterType ?? agent.adapterType;
+      const redactedAdapterConfig =
+        redactEventPayload(
+          (agent.adapterConfig ?? normalizedHireInput.adapterConfig) as Record<string, unknown>,
+        ) ?? {};
+      const redactedRuntimeConfig =
+        redactEventPayload(
+          (normalizedHireInput.runtimeConfig ?? agent.runtimeConfig) as Record<string, unknown>,
+        ) ?? {};
+      const redactedMetadata =
+        redactEventPayload(
+          ((normalizedHireInput.metadata ?? agent.metadata ?? {}) as Record<string, unknown>),
+        ) ?? {};
+      const now = new Date();
+      approval = await approvalsSvc.create(companyId, {
+        type: "hire_existing_agent",
+        requestedByAgentId: actor.actorType === "agent" ? actor.actorId : null,
+        requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
+        status: autoApprove ? "approved" : "pending",
+        payload: {
+          name: normalizedHireInput.name,
+          role: normalizedHireInput.role,
+          title: normalizedHireInput.title ?? null,
+          icon: normalizedHireInput.icon ?? null,
+          reportsTo: normalizedHireInput.reportsTo ?? null,
+          capabilities: normalizedHireInput.capabilities ?? null,
+          adapterType: requestedAdapterType,
+          adapterConfig: redactedAdapterConfig,
+          runtimeConfig: redactedRuntimeConfig,
+          budgetMonthlyCents:
+            typeof normalizedHireInput.budgetMonthlyCents === "number"
+              ? normalizedHireInput.budgetMonthlyCents
+              : agent.budgetMonthlyCents,
+          desiredSkills: desiredSkillAssignment.desiredSkills,
+          metadata: redactedMetadata,
+          agentId: agent.id,
+          importSource: "hire_existing",
+          autoApproved: autoApprove,
+          requestedConfigurationSnapshot: {
+            adapterType: requestedAdapterType,
+            adapterConfig: redactedAdapterConfig,
+            runtimeConfig: redactedRuntimeConfig,
+            desiredSkills: desiredSkillAssignment.desiredSkills,
+          },
+        },
+        decisionNote: autoApprove ? "Auto-approved: import triggered by board-tier user" : null,
+        decidedByUserId: autoApprove ? actor.actorId : null,
+        decidedAt: autoApprove ? now : null,
+        updatedAt: now,
+      });
+
+      if (sourceIssueIds.length > 0) {
+        await issueApprovalsSvc.linkManyForApproval(approval.id, sourceIssueIds, {
+          agentId: actor.actorType === "agent" ? actor.actorId : null,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        });
+      }
+    }
+
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "agent.imported",
+      entityType: "agent",
+      entityId: agent.id,
+      details: {
+        name: agent.name,
+        role: agent.role,
+        adapterType: agent.adapterType,
+        requiresApproval,
+        autoApproved: autoApprove,
+        approvalId: approval?.id ?? null,
+        issueIds: sourceIssueIds,
+        desiredSkills: desiredSkillAssignment.desiredSkills,
+      },
+    });
+    const telemetryClient = getTelemetryClient();
+    if (telemetryClient) {
+      trackAgentCreated(telemetryClient, { agentRole: agent.role, agentId: agent.id });
+    }
+
+    await applyDefaultAgentTaskAssignGrant(
+      companyId,
+      agent.id,
+      actor.actorType === "user" ? actor.actorId : null,
+    );
+
+    if (approval) {
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: autoApprove ? "approval.auto_approved" : "approval.created",
+        entityType: "approval",
+        entityId: approval.id,
+        details: { type: approval.type, linkedAgentId: agent.id },
+      });
+    }
+
+    if (keyOutcome.issuedApiKey) {
+      await logActivity(db, {
+        companyId,
+        actorType: "user",
+        actorId: actor.actorId,
+        action: "agent.key_created",
+        entityType: "agent",
+        entityId: agent.id,
+        details: {
+          keyId: keyOutcome.issuedApiKey.id,
+          name: keyOutcome.issuedApiKey.name,
+          source: "import",
+          keyAction: keyOutcome.action,
+          keyPath: keyOutcome.path,
+          writeStatus: keyOutcome.writeStatus,
+        },
+      });
+    }
+
+    res.status(201).json({
+      agent,
+      approval,
+      keyAction: keyOutcome.action,
+      keyPath: keyOutcome.path,
+      writeStatus: keyOutcome.writeStatus,
+      writeError: keyOutcome.writeError,
+      // Only returned when the server couldn't write the file — operator has
+      // to paste manually in that case. Never included on successful writes.
+      fallbackToken: keyOutcome.fallbackToken,
+    });
   });
 
   router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {

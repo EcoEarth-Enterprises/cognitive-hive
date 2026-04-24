@@ -29,4 +29,11 @@ export type {
   ConfigFieldSchema,
   AdapterConfigSchema,
   ServerAdapterModule,
+  DiscoveredAgent,
+  DiscoverAgentsInput,
+  DiscoverAgentsResult,
+  DiscoveryErrorKind,
+  ApiKeyStorageDescriptor,
+  GetApiKeyStorageInput,
 } from "@paperclipai/adapter-utils";
+export { DiscoveryError } from "@paperclipai/adapter-utils";
