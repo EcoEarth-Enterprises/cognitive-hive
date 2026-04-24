@@ -99,6 +99,12 @@ export function NewAgentDialog() {
     navigate(`/agents/new?adapterType=${encodeURIComponent(adapterType)}`);
   }
 
+  function handleImportExisting() {
+    closeNewAgent();
+    setShowAdvancedCards(false);
+    navigate("/agents/import");
+  }
+
   return (
     <Dialog
       open={newAgentOpen}
@@ -149,13 +155,19 @@ export function NewAgentDialog() {
                 Ask the CEO to create a new agent
               </Button>
 
-              {/* Advanced link */}
-              <div className="text-center">
+              {/* Secondary options */}
+              <div className="text-center space-y-2">
                 <button
-                  className="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2 transition-colors"
+                  className="block w-full text-xs text-muted-foreground hover:text-foreground underline underline-offset-2 transition-colors"
                   onClick={handleAdvancedConfig}
                 >
                   I want advanced configuration myself
+                </button>
+                <button
+                  className="block w-full text-xs text-muted-foreground hover:text-foreground underline underline-offset-2 transition-colors"
+                  onClick={handleImportExisting}
+                >
+                  Import an existing agent →
                 </button>
               </div>
             </>
@@ -200,6 +212,15 @@ export function NewAgentDialog() {
                     </span>
                   </button>
                 ))}
+              </div>
+
+              <div className="text-center">
+                <button
+                  className="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2 transition-colors"
+                  onClick={handleImportExisting}
+                >
+                  Or import an existing agent →
+                </button>
               </div>
             </>
           )}
