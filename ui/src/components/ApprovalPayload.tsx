@@ -1,8 +1,9 @@
-import { UserPlus, Lightbulb, ShieldAlert, ShieldCheck } from "lucide-react";
+import { UserPlus, UserCheck, Lightbulb, ShieldAlert, ShieldCheck } from "lucide-react";
 import { formatCents } from "../lib/utils";
 
 export const typeLabel: Record<string, string> = {
   hire_agent: "Hire Agent",
+  hire_existing_agent: "Hire Existing Agent",
   approve_ceo_strategy: "CEO Strategy",
   budget_override_required: "Budget Override",
   request_board_approval: "Board Approval",
@@ -38,6 +39,7 @@ export function approvalLabel(type: string, payload?: Record<string, unknown> | 
 
 export const typeIcon: Record<string, typeof UserPlus> = {
   hire_agent: UserPlus,
+  hire_existing_agent: UserCheck,
   approve_ceo_strategy: Lightbulb,
   budget_override_required: ShieldAlert,
   request_board_approval: ShieldCheck,
@@ -238,7 +240,7 @@ export function ApprovalPayloadRenderer({
   payload: Record<string, unknown>;
   hidePrimaryTitle?: boolean;
 }) {
-  if (type === "hire_agent") return <HireAgentPayload payload={payload} />;
+  if (type === "hire_agent" || type === "hire_existing_agent") return <HireAgentPayload payload={payload} />;
   if (type === "budget_override_required") return <BudgetOverridePayload payload={payload} />;
   if (type === "request_board_approval") {
     return <BoardApprovalPayload payload={payload} hideTitle={hidePrimaryTitle} />;
