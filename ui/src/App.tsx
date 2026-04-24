@@ -283,6 +283,7 @@ export function App() {
           <Route path="settings/*" element={<LegacySettingsRedirect />} />
           <Route path="agents" element={<UnprefixedBoardRedirect />} />
           <Route path="agents/new" element={<UnprefixedBoardRedirect />} />
+          <Route path="agents/import" element={<UnprefixedBoardRedirect />} />
           <Route path="agents/:agentId" element={<UnprefixedBoardRedirect />} />
           <Route path="agents/:agentId/:tab" element={<UnprefixedBoardRedirect />} />
           <Route path="agents/:agentId/runs/:runId" element={<UnprefixedBoardRedirect />} />

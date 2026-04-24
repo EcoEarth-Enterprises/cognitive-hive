@@ -48,6 +48,12 @@ export default defineConfig({
       PAPERCLIP_BIND: "loopback",
       PAPERCLIP_DEPLOYMENT_MODE: "local_trusted",
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "private",
+      // Force DB isolation: blank out any DATABASE_URL inherited from the
+      // repo-root .env so the test instance falls through to a fresh
+      // embedded-postgres under PAPERCLIP_HOME. Without this, the test
+      // connects to the developer's active dev database and pollutes it.
+      DATABASE_URL: "",
+      PAPERCLIP_DATABASE_URL: "",
     },
   },
   outputDir: "./test-results",
