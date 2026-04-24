@@ -752,7 +752,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(blockedIssue?.executionRunId).toBeNull();
     expect(blockedIssue?.checkoutRunId).toBe(continuationRun?.id ?? null);
 
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    const comments = await waitForValue(async () => {
+      const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      return rows.length > 0 ? rows : null;
+    });
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("retried continuation");
   });
@@ -762,11 +765,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       exitCode: 1,
       signal: null,
       timedOut: false,
-      errorCode: "codex_transient_upstream",
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
       errorMessage:
         "Error running remote compact task: We're currently experiencing high demand, which may cause temporary errors.",
       provider: "openai",
       model: "gpt-5.4",
+      resultJson: {
+        errorFamily: "transient_upstream",
+      },
     });
 
     const { agentId, runId, issueId } = await seedQueuedIssueRunFixture();
@@ -787,7 +794,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const failedRun = runs?.find((row) => row.id === runId);
     const retryRun = runs?.find((row) => row.id !== runId);
     expect(failedRun?.status).toBe("failed");
-    expect(failedRun?.errorCode).toBe("codex_transient_upstream");
+    expect(failedRun?.errorCode).toBe("adapter_failed");
+    expect((failedRun?.resultJson as Record<string, unknown> | null)?.errorFamily).toBe("transient_upstream");
     expect(retryRun?.status).toBe("scheduled_retry");
     expect(retryRun?.scheduledRetryReason).toBe("transient_failure");
     expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.codexTransientFallbackMode).toBe("same_session");

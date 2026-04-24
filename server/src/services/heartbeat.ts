@@ -8,11 +8,19 @@ import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  isEnvironmentDriverSupportedForAdapter,
   type BillingType,
+  type EnvironmentLeaseStatus,
   type ExecutionWorkspace,
   type ExecutionWorkspaceConfig,
   type RunLivenessState,
 } from "@paperclipai/shared";
+import {
+  ensureSshWorkspaceReady,
+  findReachablePaperclipApiUrlOverSsh,
+  type SshRemoteExecutionSpec,
+} from "@paperclipai/adapter-utils/ssh";
+import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import {
   agents,
   agentRuntimeState,
@@ -80,10 +88,15 @@ import {
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
 import {
+  ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
+  issueTreeControlService,
+} from "./issue-tree-control.js";
+import {
   getIssueContinuationSummaryDocument,
   refreshIssueContinuationSummary,
 } from "./issue-continuation-summary.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { environmentService } from "./environments.js";
 import { workspaceOperationService } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
@@ -92,8 +105,10 @@ import {
   issueExecutionWorkspaceModeForPersistedWorkspace,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
+  resolveExecutionWorkspaceEnvironmentId,
   resolveExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
+import { resolveEnvironmentDriverConfigForRuntime } from "./environment-config.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import {
   RUN_LIVENESS_CONTINUATION_REASON,
@@ -122,6 +137,10 @@ const MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS = 100;
 const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
+const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
+  "environment.lease_acquired",
+  "environment.lease_released",
+];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
@@ -159,6 +178,61 @@ function resolveCodexTransientFallbackMode(attempt: number): CodexTransientFallb
   if (attempt === 2) return "safer_invocation";
   if (attempt === 3) return "fresh_session";
   return "fresh_session_safer_invocation";
+}
+
+function readHeartbeatRunErrorFamily(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+) {
+  const resultJson = parseObject(run.resultJson);
+  const persistedFamily = readNonEmptyString(resultJson.errorFamily);
+  if (persistedFamily) return persistedFamily;
+
+  if (run.errorCode === "codex_transient_upstream" || run.errorCode === "claude_transient_upstream") {
+    return "transient_upstream";
+  }
+  return null;
+}
+
+function readTransientRetryNotBeforeFromRun(run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">) {
+  const resultJson = parseObject(run.resultJson);
+  const value = resultJson.retryNotBefore ?? resultJson.transientRetryNotBefore;
+  if (!(typeof value === "string" || typeof value === "number" || value instanceof Date)) {
+    return null;
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function readTransientRecoveryContractFromRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+) {
+  return readHeartbeatRunErrorFamily(run) === "transient_upstream"
+    ? {
+        errorFamily: "transient_upstream" as const,
+        retryNotBefore: readTransientRetryNotBeforeFromRun(run),
+      }
+    : null;
+}
+
+function mergeAdapterRecoveryMetadata(input: {
+  resultJson: Record<string, unknown> | null | undefined;
+  errorFamily?: string | null;
+  retryNotBefore?: string | null;
+}) {
+  const errorFamily = readNonEmptyString(input.errorFamily);
+  const retryNotBefore = readNonEmptyString(input.retryNotBefore);
+  if (!input.resultJson && !errorFamily && !retryNotBefore) return input.resultJson ?? null;
+
+  return {
+    ...(input.resultJson ?? {}),
+    ...(errorFamily ? { errorFamily } : {}),
+    ...(retryNotBefore
+      ? {
+          retryNotBefore,
+          transientRetryNotBefore: retryNotBefore,
+        }
+      : {}),
+  };
 }
 const RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP = new Set(["approval_approved"]);
 const SESSIONED_LOCAL_ADAPTERS = new Set([
@@ -306,6 +380,33 @@ async function resolveRunScopedMentionedSkillKeys(input: {
     .filter((skillKey): skillKey is string => Boolean(skillKey));
 }
 
+function leaseReleaseStatusForRunStatus(
+  status: string | null | undefined,
+): Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed"> {
+  return status === "failed" || status === "timed_out" ? "failed" : "released";
+}
+
+function runtimeApiUrlCandidates() {
+  const candidates = [
+    process.env.PAPERCLIP_RUNTIME_API_URL,
+    process.env.PAPERCLIP_API_URL,
+    process.env.PUBLIC_BASE_URL,
+  ].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+  const encoded = process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON;
+  if (!encoded) return candidates;
+  try {
+    const parsed = JSON.parse(encoded);
+    if (Array.isArray(parsed)) {
+      candidates.push(
+        ...parsed.filter((value): value is string => typeof value === "string" && value.trim().length > 0),
+      );
+    }
+  } catch {
+    logger.warn("Ignoring invalid PAPERCLIP_RUNTIME_API_CANDIDATES_JSON");
+  }
+  return candidates;
+}
+
 export function applyPersistedExecutionWorkspaceConfig(input: {
   config: Record<string, unknown>;
   workspaceConfig: ExecutionWorkspaceConfig | null;
@@ -375,9 +476,19 @@ export function buildRealizedExecutionWorkspaceFromPersisted(input: {
   };
 }
 
-function buildExecutionWorkspaceConfigSnapshot(config: Record<string, unknown>): Partial<ExecutionWorkspaceConfig> | null {
+function buildExecutionWorkspaceConfigSnapshot(
+  config: Record<string, unknown>,
+  environmentId?: string | null,
+): Partial<ExecutionWorkspaceConfig> | null {
   const strategy = parseObject(config.workspaceStrategy);
   const snapshot: Partial<ExecutionWorkspaceConfig> = {};
+  // Persist the resolved environment onto the workspace so reused sessions stay on the
+  // environment they were created against until the workspace itself is recreated/reset.
+  const hasExplicitEnvironmentSelection = environmentId !== undefined;
+
+  if (hasExplicitEnvironmentSelection) {
+    snapshot.environmentId = environmentId ?? null;
+  }
 
   if ("workspaceStrategy" in config) {
     snapshot.provisionCommand = typeof strategy.provisionCommand === "string" ? strategy.provisionCommand : null;
@@ -410,7 +521,7 @@ function buildExecutionWorkspaceConfigSnapshot(config: Record<string, unknown>):
     if (typeof value === "object") return Object.keys(value).length > 0;
     return true;
   });
-  return hasSnapshot ? snapshot : null;
+  return hasSnapshot || hasExplicitEnvironmentSelection ? snapshot : null;
 }
 
 function deriveRepoNameFromRepoUrl(repoUrl: string | null): string | null {
@@ -1239,17 +1350,11 @@ function shouldRequireIssueCommentForWake(
   );
 }
 
-const BLOCKED_INTERACTION_WAKE_REASONS = new Set([
-  "issue_commented",
-  "issue_reopened_via_comment",
-  "issue_comment_mentioned",
-]);
-
-function allowsBlockedIssueInteractionWake(
+function allowsIssueInteractionWake(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
-  if (!wakeReason || !BLOCKED_INTERACTION_WAKE_REASONS.has(wakeReason)) return false;
+  if (!wakeReason || !ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS.has(wakeReason)) return false;
   return Boolean(deriveCommentId(contextSnapshot, null));
 }
 
@@ -1618,6 +1723,8 @@ async function buildPaperclipWakePayload(input: {
       : null,
     checkedOutByHarness: input.contextSnapshot[PAPERCLIP_HARNESS_CHECKOUT_KEY] === true,
     dependencyBlockedInteraction: input.contextSnapshot.dependencyBlockedInteraction === true,
+    treeHoldInteraction: input.contextSnapshot.treeHoldInteraction === true,
+    activeTreeHold: parseObject(input.contextSnapshot.activeTreeHold),
     unresolvedBlockerIssueIds: Array.isArray(input.contextSnapshot.unresolvedBlockerIssueIds)
       ? input.contextSnapshot.unresolvedBlockerIssueIds.filter((value): value is string => typeof value === "string" && value.length > 0)
       : [],
@@ -1831,7 +1938,9 @@ export function heartbeatService(db: Db) {
   const secretsSvc = secretService(db);
   const companySkills = companySkillService(db);
   const issuesSvc = issueService(db);
+  const treeControlSvc = issueTreeControlService(db);
   const executionWorkspacesSvc = executionWorkspaceService(db);
+  const environmentsSvc = environmentService(db);
   const workspaceOperationsSvc = workspaceOperationService(db);
   const activeRunExecutions = new Set<string>();
   const budgetHooks = {
@@ -2991,6 +3100,26 @@ export function heartbeatService(db: Db) {
     return retryRun;
   }
 
+  async function hasDeferredIssueCommentWake(companyId: string, issueId: string, agentId: string) {
+    const deferredPayloads = await db
+      .select({ payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+        ),
+      );
+
+    return deferredPayloads.some(({ payload }) => {
+      const parsedPayload = parseObject(payload);
+      const deferredContext = parseObject(parsedPayload[DEFERRED_WAKE_CONTEXT_KEY]);
+      return Boolean(deriveCommentId(deferredContext, parsedPayload));
+    });
+  }
+
   async function finalizeIssueCommentPolicy(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -3040,6 +3169,21 @@ export function heartbeatService(db: Db) {
           issueCommentRetryQueuedAt: null,
         });
       }
+      return { outcome: "not_applicable" as const, queuedRun: null };
+    }
+
+    if (await hasDeferredIssueCommentWake(run.companyId, issueId, run.agentId)) {
+      await patchRunIssueCommentStatus(run.id, {
+        issueCommentStatus: "not_applicable",
+        issueCommentSatisfiedByCommentId: null,
+        issueCommentRetryQueuedAt: null,
+      });
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: "Run ended without an issue comment; a deferred comment wake already exists for this issue",
+      });
       return { outcome: "not_applicable" as const, queuedRun: null };
     }
 
@@ -3178,13 +3322,18 @@ export function heartbeatService(db: Db) {
     const retryReason = opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
     const wakeReason = opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
     const nextAttempt = (run.scheduledRetryAttempt ?? 0) + 1;
-    const schedule = computeBoundedTransientHeartbeatRetrySchedule(nextAttempt, now, opts?.random);
+    const baseSchedule = computeBoundedTransientHeartbeatRetrySchedule(nextAttempt, now, opts?.random);
+    const transientRecovery =
+      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
+        ? readTransientRecoveryContractFromRun(run)
+        : null;
     const codexTransientFallbackMode =
-      agent.adapterType === "codex_local" && retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON && run.errorCode === "codex_transient_upstream"
+      agent.adapterType === "codex_local" && transientRecovery
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
+    const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
 
-    if (!schedule) {
+    if (!baseSchedule) {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
         eventType: "lifecycle",
         stream: "system",
@@ -3202,6 +3351,14 @@ export function heartbeatService(db: Db) {
         maxAttempts: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
       };
     }
+    const schedule =
+      transientRetryNotBefore && transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+        ? {
+            ...baseSchedule,
+            dueAt: transientRetryNotBefore,
+            delayMs: Math.max(0, transientRetryNotBefore.getTime() - now.getTime()),
+          }
+        : baseSchedule;
 
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
@@ -3212,8 +3369,10 @@ export function heartbeatService(db: Db) {
       retryOfRunId: run.id,
       wakeReason,
       retryReason,
+      ...(transientRecovery ? { errorFamily: transientRecovery.errorFamily } : {}),
       scheduledRetryAttempt: schedule.attempt,
       scheduledRetryAt: schedule.dueAt.toISOString(),
+      ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
     };
 
@@ -3230,8 +3389,10 @@ export function heartbeatService(db: Db) {
             ...(issueId ? { issueId } : {}),
             retryOfRunId: run.id,
             retryReason,
+            ...(transientRecovery ? { errorFamily: transientRecovery.errorFamily } : {}),
             scheduledRetryAttempt: schedule.attempt,
             scheduledRetryAt: schedule.dueAt.toISOString(),
+            ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
             ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
           },
           status: "queued",
@@ -3294,10 +3455,12 @@ export function heartbeatService(db: Db) {
       payload: {
         retryRunId: retryRun.id,
         retryReason,
+        ...(transientRecovery ? { errorFamily: transientRecovery.errorFamily } : {}),
         scheduledRetryAttempt: schedule.attempt,
         scheduledRetryAt: schedule.dueAt.toISOString(),
         baseDelayMs: schedule.baseDelayMs,
         delayMs: schedule.delayMs,
+        ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
       },
     });
@@ -3451,9 +3614,33 @@ export function heartbeatService(db: Db) {
 
     const issueId = readNonEmptyString(context.issueId);
     if (issueId) {
+      const activePauseHold = await treeControlSvc.getActivePauseHoldGate(run.companyId, issueId);
+      const treeHoldInteractionWake = activePauseHold && allowsIssueInteractionWake(context);
+      if (activePauseHold && !treeHoldInteractionWake) {
+        await cancelRunInternal(run.id, "Cancelled because issue is held by an active subtree pause hold");
+        await logActivity(db, {
+          companyId: run.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: run.agentId,
+          runId: run.id,
+          action: "issue.tree_hold_run_interrupted",
+          entityType: "heartbeat_run",
+          entityId: run.id,
+          details: {
+            issueId,
+            holdId: activePauseHold.holdId,
+            rootIssueId: activePauseHold.rootIssueId,
+            source: "heartbeat.claim_queued_run",
+            securityPrinciples: ["Complete Mediation", "Fail Securely", "Secure Defaults"],
+          },
+        });
+        return null;
+      }
+
       const dependencyReadiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
       const unresolvedBlockerCount = dependencyReadiness.get(issueId)?.unresolvedBlockerCount ?? 0;
-      if (unresolvedBlockerCount > 0 && !allowsBlockedIssueInteractionWake(context)) {
+      if (unresolvedBlockerCount > 0 && !allowsIssueInteractionWake(context)) {
         logger.debug({ runId: run.id, issueId, unresolvedBlockerCount }, "claimQueuedRun: skipping blocked run");
         return null;
       }
@@ -3698,7 +3885,13 @@ export function heartbeatService(db: Db) {
         latestAt: sql<Date | null>`max(${activityLog.createdAt})`,
       })
       .from(activityLog)
-      .where(and(eq(activityLog.companyId, run.companyId), eq(activityLog.runId, run.id)));
+      .where(
+        and(
+          eq(activityLog.companyId, run.companyId),
+          eq(activityLog.runId, run.id),
+          notInArray(activityLog.action, LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS),
+        ),
+      );
 
     const [eventStats] = await db
       .select({
@@ -4982,7 +5175,15 @@ export function heartbeatService(db: Db) {
     const mergedConfig = issueAssigneeOverrides?.adapterConfig
       ? { ...persistedWorkspaceManagedConfig, ...issueAssigneeOverrides.adapterConfig }
       : persistedWorkspaceManagedConfig;
-    const configSnapshot = buildExecutionWorkspaceConfigSnapshot(mergedConfig);
+    const defaultEnvironment = await environmentsSvc.ensureLocalEnvironment(agent.companyId);
+    const selectedEnvironmentId = resolveExecutionWorkspaceEnvironmentId({
+      projectPolicy: projectExecutionWorkspacePolicy,
+      issueSettings: issueExecutionWorkspaceSettings,
+      workspaceConfig: existingExecutionWorkspace?.config ?? null,
+      agentDefaultEnvironmentId: agent.defaultEnvironmentId,
+      defaultEnvironmentId: defaultEnvironment.id,
+    });
+    const configSnapshot = buildExecutionWorkspaceConfigSnapshot(mergedConfig, selectedEnvironmentId);
     const executionRunConfig = stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);
     const { resolvedConfig, secretKeys } = await resolveExecutionRunAdapterConfig({
       companyId: agent.companyId,
@@ -5215,6 +5416,126 @@ export function heartbeatService(db: Db) {
       })(),
     };
     context.paperclipWorkspaces = resolvedWorkspace.workspaceHints;
+    const selectedEnvironment =
+      selectedEnvironmentId === defaultEnvironment.id
+        ? defaultEnvironment
+        : await environmentsSvc.getById(selectedEnvironmentId);
+    if (!selectedEnvironment || selectedEnvironment.companyId !== agent.companyId) {
+      throw notFound(`Environment "${selectedEnvironmentId}" not found.`);
+    }
+    if (selectedEnvironment.status !== "active") {
+      throw conflict(`Environment "${selectedEnvironment.name}" is not active.`);
+    }
+    if (!isEnvironmentDriverSupportedForAdapter(agent.adapterType, selectedEnvironment.driver)) {
+      throw conflict(
+        `Adapter "${agent.adapterType}" does not support "${selectedEnvironment.driver}" environments.`,
+      );
+    }
+
+    const selectedEnvironmentRuntimeConfig = await resolveEnvironmentDriverConfigForRuntime(
+      db,
+      agent.companyId,
+      selectedEnvironment,
+    );
+    let environmentProvider = selectedEnvironment.driver;
+    let environmentProviderLeaseId: string | null = null;
+    let environmentLeaseMetadata: Record<string, unknown> = {
+      driver: selectedEnvironment.driver,
+      executionWorkspaceMode: persistedExecutionWorkspace?.mode ?? effectiveExecutionWorkspaceMode,
+      cwd: executionWorkspace.cwd,
+    };
+    let executionTarget: AdapterExecutionTarget | null = null;
+    let remoteExecution: SshRemoteExecutionSpec | null = null;
+
+    if (selectedEnvironmentRuntimeConfig.driver === "ssh") {
+      const { remoteCwd } = await ensureSshWorkspaceReady(selectedEnvironmentRuntimeConfig.config);
+      const paperclipApiUrl = await findReachablePaperclipApiUrlOverSsh({
+        config: selectedEnvironmentRuntimeConfig.config,
+        candidates: runtimeApiUrlCandidates(),
+      });
+      remoteExecution = {
+        ...selectedEnvironmentRuntimeConfig.config,
+        remoteCwd,
+        paperclipApiUrl,
+      };
+      environmentProvider = "ssh";
+      environmentProviderLeaseId = `ssh://${selectedEnvironmentRuntimeConfig.config.username}@${selectedEnvironmentRuntimeConfig.config.host}:${selectedEnvironmentRuntimeConfig.config.port}${remoteCwd}`;
+      environmentLeaseMetadata = {
+        ...environmentLeaseMetadata,
+        host: selectedEnvironmentRuntimeConfig.config.host,
+        port: selectedEnvironmentRuntimeConfig.config.port,
+        username: selectedEnvironmentRuntimeConfig.config.username,
+        remoteWorkspacePath: selectedEnvironmentRuntimeConfig.config.remoteWorkspacePath,
+        remoteCwd,
+        paperclipApiUrl,
+      };
+    }
+
+    const environmentLease = await environmentsSvc.acquireLease({
+      companyId: agent.companyId,
+      environmentId: selectedEnvironment.id,
+      executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
+      issueId: issueId ?? null,
+      heartbeatRunId: run.id,
+      leasePolicy: "ephemeral",
+      provider: environmentProvider,
+      providerLeaseId: environmentProviderLeaseId,
+      metadata: environmentLeaseMetadata,
+    });
+    if (remoteExecution) {
+      executionTarget = {
+        kind: "remote",
+        transport: "ssh",
+        environmentId: selectedEnvironment.id,
+        leaseId: environmentLease.id,
+        remoteCwd: remoteExecution.remoteCwd,
+        paperclipApiUrl: remoteExecution.paperclipApiUrl,
+        spec: remoteExecution,
+      };
+    }
+    context.paperclipEnvironment = {
+      id: selectedEnvironment.id,
+      name: selectedEnvironment.name,
+      driver: selectedEnvironment.driver,
+      leaseId: environmentLease.id,
+      ...(typeof environmentLease.metadata?.remoteCwd === "string"
+        ? {
+            remoteCwd: environmentLease.metadata.remoteCwd,
+            host:
+              typeof environmentLease.metadata?.host === "string"
+                ? environmentLease.metadata.host
+                : undefined,
+            port:
+              typeof environmentLease.metadata?.port === "number"
+                ? environmentLease.metadata.port
+                : undefined,
+            username:
+              typeof environmentLease.metadata?.username === "string"
+                ? environmentLease.metadata.username
+                : undefined,
+          }
+        : {}),
+    };
+    await logActivity(db, {
+      companyId: agent.companyId,
+      actorType: "agent",
+      actorId: agent.id,
+      agentId: agent.id,
+      runId: run.id,
+      action: "environment.lease_acquired",
+      entityType: "environment_lease",
+      entityId: environmentLease.id,
+      details: {
+        environmentId: selectedEnvironment.id,
+        driver: selectedEnvironment.driver,
+        leasePolicy: environmentLease.leasePolicy,
+        provider: environmentLease.provider,
+        executionWorkspaceId: environmentLease.executionWorkspaceId,
+        issueId,
+      },
+    }).catch((err) => {
+      logger.warn({ err, runId: run.id }, "failed to log environment lease acquisition");
+    });
     const runtimeServiceIntents = (() => {
       const runtimeConfig = parseObject(resolvedConfig.workspaceRuntime);
       return Array.isArray(runtimeConfig.services)
@@ -5231,6 +5552,13 @@ export function heartbeatService(db: Db) {
     if (executionWorkspace.projectId && !readNonEmptyString(context.projectId)) {
       context.projectId = executionWorkspace.projectId;
     }
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: context,
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, run.id));
     const runtimeSessionFallback = taskKey || resetTaskSession ? null : runtime.sessionId;
     let previousSessionDisplayId = truncateDisplayId(
       explicitResumeSessionDisplayId ??
@@ -5465,6 +5793,10 @@ export function heartbeatService(db: Db) {
         runtime: runtimeForAdapter,
         config: runtimeConfig,
         context,
+        executionTarget,
+        executionTransport: remoteExecution
+          ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
+          : undefined,
         onLog,
         onMeta: onAdapterMeta,
         onSpawn: async (meta) => {
@@ -5614,7 +5946,11 @@ export function heartbeatService(db: Db) {
 
       const persistedResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {
-          resultJson: adapterResult.resultJson ?? null,
+          resultJson: mergeAdapterRecoveryMetadata({
+            resultJson: adapterResult.resultJson ?? null,
+            errorFamily: adapterResult.errorFamily ?? null,
+            retryNotBefore: adapterResult.retryNotBefore ?? null,
+          }),
           errorCode: runErrorCode,
           errorMessage: runErrorMessage,
         }),
@@ -5675,7 +6011,7 @@ export function heartbeatService(db: Db) {
             );
           }
         }
-        if (outcome === "failed" && livenessRun.errorCode === "codex_transient_upstream") {
+        if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
         await finalizeIssueCommentPolicy(livenessRun, agent);
@@ -5823,6 +6159,34 @@ export function heartbeatService(db: Db) {
           // DB calls threw (e.g. a transient DB error in finalizeAgentStatus).
           await finalizeAgentStatus(run.agentId, "failed").catch(() => undefined);
         } finally {
+          const latestRun = await getRun(run.id).catch(() => null);
+          const releasedLeases = await environmentsSvc
+            .releaseLeasesForRun(run.id, leaseReleaseStatusForRunStatus(latestRun?.status))
+            .catch((err) => {
+              logger.warn({ err, runId: run.id }, "failed to release environment leases for heartbeat run");
+              return [];
+            });
+          for (const lease of releasedLeases) {
+            await logActivity(db, {
+              companyId: run.companyId,
+              actorType: "agent",
+              actorId: run.agentId,
+              agentId: run.agentId,
+              runId: run.id,
+              action: "environment.lease_released",
+              entityType: "environment_lease",
+              entityId: lease.id,
+              details: {
+                environmentId: lease.environmentId,
+                driver: lease.metadata?.driver ?? "local",
+                leasePolicy: lease.leasePolicy,
+                provider: lease.provider,
+                executionWorkspaceId: lease.executionWorkspaceId,
+                issueId: lease.issueId,
+                status: lease.status,
+              },
+            }).catch(() => undefined);
+          }
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
           activeRunExecutions.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
@@ -5953,10 +6317,44 @@ export function heartbeatService(db: Db) {
 
         const deferredPayload = parseObject(deferred.payload);
         const deferredContextSeed = parseObject(deferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
+        const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id);
+        const treeHoldInteractionWake = activePauseHold && allowsIssueInteractionWake(deferredContextSeed);
+        if (activePauseHold && !treeHoldInteractionWake) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error: "Deferred wake suppressed by active subtree pause hold",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
+        }
+
         const promotedContextSeed: Record<string, unknown> = { ...deferredContextSeed };
+        if (activePauseHold) {
+          promotedContextSeed.treeHoldInteraction = true;
+          promotedContextSeed.activeTreeHold = {
+            holdId: activePauseHold.holdId,
+            rootIssueId: activePauseHold.rootIssueId,
+            mode: activePauseHold.mode,
+            reason: activePauseHold.reason,
+            releasePolicy: activePauseHold.releasePolicy,
+            interaction: true,
+          };
+        }
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
+        const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
+        // Only human/comment-reopen interactions should revive completed issues;
+        // system follow-ups such as retry or cleanup wakes must not reopen closed work.
         const shouldReopenDeferredCommentWake =
-          deferredCommentIds.length > 0 && (issue.status === "done" || issue.status === "cancelled");
+          deferredCommentIds.length > 0 &&
+          (issue.status === "done" || issue.status === "cancelled") &&
+          (
+            deferred.requestedByActorType === "user" ||
+            deferredWakeReason === "issue_reopened_via_comment"
+          );
         let reopenedActivity: LogActivityInput | null = null;
 
         if (shouldReopenDeferredCommentWake) {
@@ -6343,6 +6741,46 @@ export function heartbeatService(db: Db) {
     }
 
     if (issueId) {
+      const activePauseHold = await treeControlSvc.getActivePauseHoldGate(agent.companyId, issueId);
+      if (activePauseHold) {
+        const treeHoldInteractionWake = allowsIssueInteractionWake(enrichedContextSnapshot);
+
+        if (!treeHoldInteractionWake) {
+          await writeSkippedRequest("issue_tree_hold_active");
+          await logActivity(db, {
+            companyId: agent.companyId,
+            actorType: "system",
+            actorId: "system",
+            agentId,
+            runId: null,
+            action: "issue.tree_hold_wakeup_deferred",
+            entityType: "issue",
+            entityId: issueId,
+            details: {
+              holdId: activePauseHold.holdId,
+              rootIssueId: activePauseHold.rootIssueId,
+              requestedReason: reason,
+              source,
+              triggerDetail,
+              securityPrinciples: ["Complete Mediation", "Fail Securely", "Secure Defaults"],
+            },
+          });
+          return null;
+        }
+
+        enrichedContextSnapshot.treeHoldInteraction = true;
+        enrichedContextSnapshot.activeTreeHold = {
+          holdId: activePauseHold.holdId,
+          rootIssueId: activePauseHold.rootIssueId,
+          mode: activePauseHold.mode,
+          reason: activePauseHold.reason,
+          releasePolicy: activePauseHold.releasePolicy,
+          interaction: true,
+        };
+      }
+    }
+
+    if (issueId) {
       // Mention-triggered wakes can request input from another agent, but they must
       // still respect the issue execution lock so a second agent cannot start on the
       // same issue workspace while the assignee already has a live run.
@@ -6459,7 +6897,7 @@ export function heartbeatService(db: Db) {
         const blockedInteractionWake =
           dependencyReadiness &&
           !dependencyReadiness.isDependencyReady &&
-          allowsBlockedIssueInteractionWake(enrichedContextSnapshot);
+          allowsIssueInteractionWake(enrichedContextSnapshot);
 
         if (blockedInteractionWake) {
           enrichedContextSnapshot.dependencyBlockedInteraction = true;
