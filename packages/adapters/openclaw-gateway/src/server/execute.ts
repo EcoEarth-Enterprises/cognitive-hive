@@ -1136,7 +1136,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     idempotencyKey: ctx.runId,
   };
   delete agentParams.text;
-  agentParams.paperclip = paperclipPayload;
+
+  // Newer OpenClaw gateways accept a top-level `paperclip` param carrying
+  // standardized workspace/runtime context; older gateways (e.g. v2026.4.15
+  // and earlier) reject it with "unexpected property 'paperclip'". Default
+  // off in this fork so older gateways work out of the box; set
+  // `includePaperclipPayload: true` on the agent's adapterConfig to opt in
+  // when your gateway supports it.
+  const includePaperclipPayload = parseBoolean(ctx.config.includePaperclipPayload, false);
+  if (includePaperclipPayload) {
+    agentParams.paperclip = paperclipPayload;
+  }
 
   const configuredAgentId = nonEmpty(ctx.config.agentId);
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {

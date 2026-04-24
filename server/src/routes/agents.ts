@@ -51,6 +51,33 @@ import {
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import { handleApiKeyStorage } from "./agent-import-key-storage.js";
+
+/**
+ * Deep-merge adapter config objects used by the import flow: operator-supplied
+ * values (`override`) win over adapter enrichment (`base`). Only handles
+ * nested plain objects — arrays and primitives are replaced wholesale.
+ */
+function deepMergeAdapterConfig(
+  base: Record<string, unknown>,
+  override: Record<string, unknown>,
+): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(override)) {
+    const existing = result[key];
+    if (
+      existing && typeof existing === "object" && !Array.isArray(existing) &&
+      value && typeof value === "object" && !Array.isArray(value)
+    ) {
+      result[key] = deepMergeAdapterConfig(
+        existing as Record<string, unknown>,
+        value as Record<string, unknown>,
+      );
+    } else if (value !== undefined) {
+      result[key] = value;
+    }
+  }
+  return result;
+}
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
@@ -1630,10 +1657,19 @@ export function agentRoutes(db: Db) {
       req,
       (hireInput.adapterConfig ?? {}) as Record<string, unknown>,
     );
-    const requestedAdapterConfig = applyCreateDefaultsByAdapterType(
+    const baseAdapterConfig = applyCreateDefaultsByAdapterType(
       hireInput.adapterType,
       ((hireInput.adapterConfig ?? {}) as Record<string, unknown>),
     );
+    // Adapter-specific enrichment (e.g. openclaw reading the gateway token
+    // from ~/.openclaw/openclaw.json). Runs server-side so secrets never
+    // round-trip through the browser; operator-supplied fields always win.
+    const enrichment = adapter.enrichAdapterConfigForImport
+      ? await adapter.enrichAdapterConfigForImport({ adapterConfig: baseAdapterConfig })
+      : null;
+    const requestedAdapterConfig = enrichment
+      ? deepMergeAdapterConfig(enrichment, baseAdapterConfig)
+      : baseAdapterConfig;
     const desiredSkillAssignment = await resolveDesiredSkillAssignment(
       companyId,
       hireInput.adapterType,

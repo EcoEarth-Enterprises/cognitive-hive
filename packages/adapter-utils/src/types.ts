@@ -416,6 +416,22 @@ export interface ServerAdapterModule {
    * "none"` — no key file will be written and no token will be returned.
    */
   getApiKeyStorage?: (input: GetApiKeyStorageInput) => ApiKeyStorageDescriptor | null;
+
+  /**
+   * Optional. Enrich the agent's adapterConfig at import time with values
+   * the adapter can derive itself — e.g., an openclaw adapter reading a
+   * gateway auth token from the local openclaw config so the operator
+   * doesn't have to paste it by hand.
+   *
+   * Returns a Partial<adapterConfig> that will be deep-merged onto the
+   * user-supplied config before persistence. Runs server-side, so secret
+   * values never have to touch the browser.
+   *
+   * Return null or omit when the adapter can't (or chooses not to) enrich.
+   */
+  enrichAdapterConfigForImport?: (input: {
+    adapterConfig: Record<string, unknown>;
+  }) => Promise<Record<string, unknown> | null> | Record<string, unknown> | null;
   sessionCodec?: AdapterSessionCodec;
   sessionManagement?: import("./session-compaction.js").AdapterSessionManagement;
   supportsLocalAgentJwt?: boolean;
