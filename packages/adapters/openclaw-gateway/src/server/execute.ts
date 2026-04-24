@@ -343,6 +343,16 @@ function buildPaperclipEnvForWake(ctx: AdapterExecutionContext, wakePayload: Wak
     PAPERCLIP_RUN_ID: ctx.runId,
   };
 
+  // When the server supplies a per-run agent JWT via ctx.authToken
+  // (supportsLocalAgentJwt), advertise it as PAPERCLIP_API_KEY so the
+  // external agent uses THIS run's identity instead of whatever happens
+  // to be in the shared ~/.openclaw/workspace/paperclip-claimed-api-key.json
+  // file (which, being shared across all OpenClaw agents on the machine,
+  // conflates identities when multiple agents are imported).
+  if (ctx.authToken && ctx.authToken.trim().length > 0) {
+    paperclipEnv.PAPERCLIP_API_KEY = ctx.authToken;
+  }
+
   if (paperclipApiUrlOverride) {
     paperclipEnv.PAPERCLIP_API_URL = paperclipApiUrlOverride;
   }
@@ -369,6 +379,7 @@ function buildWakeText(
     "PAPERCLIP_AGENT_ID",
     "PAPERCLIP_COMPANY_ID",
     "PAPERCLIP_API_URL",
+    "PAPERCLIP_API_KEY",
     "PAPERCLIP_TASK_ID",
     "PAPERCLIP_WAKE_REASON",
     "PAPERCLIP_WAKE_COMMENT_ID",
@@ -387,6 +398,15 @@ function buildWakeText(
   const issueIdHint = payload.taskId ?? payload.issueId ?? "";
   const apiBaseHint = paperclipEnv.PAPERCLIP_API_URL ?? "<set PAPERCLIP_API_URL>";
 
+  // When the server provided a per-run agent JWT (supportsLocalAgentJwt),
+  // the token is in paperclipEnv.PAPERCLIP_API_KEY and the agent must use
+  // THAT value, not the shared claimed-api-key file. The file path is only
+  // a fallback for legacy setups that still depend on it.
+  const hasInlineApiKey = Boolean(paperclipEnv.PAPERCLIP_API_KEY);
+  const apiKeyInstruction = hasInlineApiKey
+    ? `PAPERCLIP_API_KEY is set above — use it exactly. This key is scoped to THIS run for THIS agent; do NOT read ${claimedApiKeyPath} or any other file for this value (doing so would impersonate a different agent).`
+    : `Load PAPERCLIP_API_KEY from ${claimedApiKeyPath} (the token you saved after claim-api-key).`;
+
   const lines = [
     "Paperclip wake event for a cloud adapter.",
     "",
@@ -394,9 +414,9 @@ function buildWakeText(
     "",
     "Set these values in your run context:",
     ...envLines,
-    `PAPERCLIP_API_KEY=<token from ${claimedApiKeyPath}>`,
+    ...(hasInlineApiKey ? [] : [`PAPERCLIP_API_KEY=<token from ${claimedApiKeyPath}>`]),
     "",
-    `Load PAPERCLIP_API_KEY from ${claimedApiKeyPath} (the token you saved after claim-api-key).`,
+    apiKeyInstruction,
     "",
     `api_base=${apiBaseHint}`,
     `task_id=${payload.taskId ?? ""}`,

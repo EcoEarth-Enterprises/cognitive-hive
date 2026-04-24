@@ -28,6 +28,15 @@ const IMPORT_AGENT_ROLE_DROPDOWN_LABEL = "CTO";
 const OPENCLAW_AGENT_ID = "clawdbot";
 const GATEWAY_URL = "ws://127.0.0.1:18789";
 
+// Decoy agent imported BEFORE ClawdBot so the shared
+// ~/.openclaw/workspace/paperclip-claimed-api-key.json file (if the adapter
+// still writes one) gets Brad's token first. If the per-run JWT injection
+// isn't working, ClawdBot's heartbeat will read that file and identify as
+// the decoy. Used by the impersonation-isolation assertion at the end of
+// the test.
+const DECOY_NAME = `Brad E2E Decoy ${Date.now()}`;
+const DECOY_OPENCLAW_AGENT_ID = "brad";
+
 const HEARTBEAT_POLL_TIMEOUT_MS = 4 * 60 * 1000;
 const HEARTBEAT_POLL_INTERVAL_MS = 2_000;
 
@@ -64,6 +73,30 @@ test.describe("Import existing OpenClaw agent", () => {
     const company = await ensureCompany(request, baseURL, COMPANY_NAME);
     const ceoAgent = await ensureCeoAgent(request, baseURL, company.id, CEO_NAME);
     expect(ceoAgent.role).toBe("ceo");
+
+    // ── 1b. Pre-import a decoy openclaw agent so the shared claimed-api-key
+    //       file gets its token FIRST. Any later run that reads the file
+    //       instead of the injected per-run JWT will surface as identity
+    //       impersonation (the assertion at the end of the test catches it).
+    const decoyImportRes = await request.post(
+      `${baseURL}/api/companies/${company.id}/agent-imports`,
+      {
+        data: {
+          name: DECOY_NAME,
+          role: "engineer",
+          adapterType: "openclaw_gateway",
+          adapterConfig: { url: GATEWAY_URL, agentId: DECOY_OPENCLAW_AGENT_ID },
+          budgetMonthlyCents: 0,
+          keyBehavior: "auto",
+        },
+      },
+    );
+    expect(
+      decoyImportRes.ok(),
+      `decoy import should succeed; got ${decoyImportRes.status()}: ${await decoyImportRes.text()}`,
+    ).toBe(true);
+    const decoyImport = await decoyImportRes.json();
+    const decoyAgent = decoyImport.agent as { id: string; name: string };
 
     // ── 2. Navigate to import page via the sidebar dialog ──────────────────
     await page.goto("/");
@@ -194,8 +227,50 @@ test.describe("Import existing OpenClaw agent", () => {
       );
     }
     expect(lastRun!.status).toBe("succeeded");
+
+    // ── 6. Identity isolation: ClawdBot must NOT impersonate the decoy ────
+    // Fetch the full heartbeat run log and confirm that when the agent
+    // authenticated (via GET /agents/me), it identified as ClawdBot — not
+    // the Brad decoy whose token happens to be in the shared claimed-api-key
+    // file. If supportsLocalAgentJwt / per-run token injection breaks again,
+    // this assertion catches it.
+    const logText = await fetchHeartbeatLog(request, baseURL, lastRun!.id);
+    expect(
+      logText.toLowerCase(),
+      `heartbeat log should not reference the decoy agent id "${decoyAgent.id}"`,
+    ).not.toContain(decoyAgent.id.toLowerCase());
+    expect(
+      logText,
+      `heartbeat log should not claim the agent is named "${DECOY_NAME}"`,
+    ).not.toContain(DECOY_NAME);
+    // Sanity: the imported agent's id should show up somewhere in the run's
+    // context (paperclip env lines are echoed in the wake text).
+    expect(logText).toContain(imported.id);
   });
 });
+
+async function fetchHeartbeatLog(
+  request: APIRequestContext,
+  baseURL: string,
+  runId: string,
+): Promise<string> {
+  let offset = 0;
+  let combined = "";
+  const limitBytes = 256_000;
+  for (let i = 0; i < 20; i += 1) {
+    const res = await request.get(
+      `${baseURL}/api/heartbeat-runs/${runId}/log?offset=${offset}&limitBytes=${limitBytes}`,
+    );
+    if (!res.ok()) break;
+    const body = (await res.json()) as { text?: string; content?: string; nextOffset?: number; done?: boolean };
+    const chunk = body.text ?? body.content ?? "";
+    combined += chunk;
+    const next = typeof body.nextOffset === "number" ? body.nextOffset : offset + chunk.length;
+    if (next <= offset || body.done || !chunk) break;
+    offset = next;
+  }
+  return combined;
+}
 
 // ── helpers ──────────────────────────────────────────────────────────────
 

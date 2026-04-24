@@ -198,7 +198,11 @@ const openclawGatewayAdapter: ServerAdapterModule = {
   getApiKeyStorage: openclawGatewayGetApiKeyStorage,
   enrichAdapterConfigForImport: openclawGatewayEnrichAdapterConfigForImport,
   models: openclawGatewayModels,
-  supportsLocalAgentJwt: false,
+  // The server mints a per-run JWT via createLocalAgentJwt() and passes it
+  // as ctx.authToken; the adapter advertises it as PAPERCLIP_API_KEY in the
+  // wake text so each agent authenticates as itself, not as whoever happens
+  // to own the shared claimed-api-key file.
+  supportsLocalAgentJwt: true,
   supportsInstructionsBundle: false,
   requiresMaterializedRuntimeSkills: false,
   agentConfigurationDoc: openclawGatewayAgentConfigurationDoc,
